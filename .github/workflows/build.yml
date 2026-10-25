@@ -1,1 +1,1611 @@
-build.yml
+name: Build Palweathers jar
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: Write the mod files
+        run: |
+          mkdir -p modsrc
+          cd modsrc
+          mkdir -p src/main/java/com/palweathers
+          cat > src/main/java/com/palweathers/WeatherMod.java <<'PALWEATHERS_EOF'
+          package com.palweathers;
+
+          import com.mojang.logging.LogUtils;
+          import org.slf4j.Logger;
+
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.world.item.BlockItem;
+          import net.minecraft.world.item.CreativeModeTabs;
+          import net.minecraft.world.level.block.SoundType;
+          import net.minecraft.world.level.block.state.BlockBehaviour;
+          import net.neoforged.bus.api.IEventBus;
+          import net.neoforged.fml.common.Mod;
+          import net.neoforged.neoforge.common.NeoForge;
+          import net.neoforged.neoforge.event.BuildCreativeModeTabContentsEvent;
+          import net.neoforged.neoforge.event.RegisterCommandsEvent;
+          import net.neoforged.neoforge.event.server.ServerStartingEvent;
+          import net.neoforged.neoforge.event.server.ServerStoppingEvent;
+          import net.neoforged.neoforge.event.tick.ServerTickEvent;
+          import net.neoforged.neoforge.registries.DeferredBlock;
+          import net.neoforged.neoforge.registries.DeferredItem;
+          import net.neoforged.neoforge.registries.DeferredRegister;
+
+          @Mod(WeatherMod.MOD_ID)
+          public class WeatherMod {
+              public static final String MOD_ID = "palweathers";
+              public static final Logger LOGGER = LogUtils.getLogger();
+
+              public static final DeferredRegister.Blocks BLOCKS = DeferredRegister.createBlocks(MOD_ID);
+              public static final DeferredRegister.Items ITEMS = DeferredRegister.createItems(MOD_ID);
+
+              public static final DeferredBlock<RadarBlock> RADAR_BLOCK = BLOCKS.registerBlock(
+                      "weather_radar",
+                      RadarBlock::new,
+                      BlockBehaviour.Properties.of().strength(3.0F).sound(SoundType.METAL));
+
+              public static final DeferredItem<BlockItem> RADAR_ITEM =
+                      ITEMS.registerSimpleBlockItem("weather_radar", RADAR_BLOCK);
+
+              /** If the weather code ever throws, it is switched off so the server does not crash every tick. */
+              private boolean weatherFailed = false;
+
+              public WeatherMod(IEventBus modEventBus) {
+                  BLOCKS.register(modEventBus);
+                  ITEMS.register(modEventBus);
+                  modEventBus.addListener(this::addCreative);
+
+                  NeoForge.EVENT_BUS.addListener(this::onServerTick);
+                  NeoForge.EVENT_BUS.addListener(this::onRegisterCommands);
+                  NeoForge.EVENT_BUS.addListener(this::onServerStarting);
+                  NeoForge.EVENT_BUS.addListener(this::onServerStopping);
+              }
+
+              private void addCreative(BuildCreativeModeTabContentsEvent event) {
+                  if (event.getTabKey() == CreativeModeTabs.FUNCTIONAL_BLOCKS) {
+                      event.accept(RADAR_ITEM);
+                  }
+              }
+
+              private void onServerTick(ServerTickEvent.Post event) {
+                  if (weatherFailed) {
+                      return;
+                  }
+                  try {
+                      ServerLevel overworld = event.getServer().overworld();
+                      if (overworld != null) {
+                          WeatherManager.INSTANCE.tick(overworld);
+                      }
+                  } catch (RuntimeException e) {
+                      weatherFailed = true;
+                      LOGGER.error("WeatherMod crashed and has been switched off until restart", e);
+                  }
+              }
+
+              private void onRegisterCommands(RegisterCommandsEvent event) {
+                  WeatherCommands.register(event.getDispatcher());
+              }
+
+              private void onServerStarting(ServerStartingEvent event) {
+                  WeatherManager.INSTANCE.reset();
+                  weatherFailed = false;
+              }
+
+              /** Put flood water / snow / ice back before the world is saved. */
+              private void onServerStopping(ServerStoppingEvent event) {
+                  ServerLevel overworld = event.getServer().overworld();
+                  if (overworld != null) {
+                      WeatherManager.INSTANCE.restoreAll(overworld);
+                  }
+              }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/java/com/palweathers
+          cat > src/main/java/com/palweathers/WeatherManager.java <<'PALWEATHERS_EOF'
+          package com.palweathers;
+
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Direction;
+          import net.minecraft.core.particles.ParticleTypes;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.tags.FluidTags;
+          import net.minecraft.util.Mth;
+          import net.minecraft.util.RandomSource;
+          import net.minecraft.world.effect.MobEffectInstance;
+          import net.minecraft.world.effect.MobEffects;
+          import net.minecraft.world.entity.LivingEntity;
+          import net.minecraft.world.level.block.Block;
+          import net.minecraft.world.level.block.Blocks;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.level.levelgen.Heightmap;
+          import net.minecraft.world.phys.AABB;
+
+          /**
+           * The whole weather system. Works in the Overworld only, on the server.
+           *
+           * Climate decides what can happen:
+           *   MILD: nice weather -> rain -> (flood)
+           *   HOT : storm, cloud wall -> hail -> tornado, hurricane
+           *   COLD: snow storm -> ice (water freezes)
+           */
+          public final class WeatherManager {
+              public static final WeatherManager INSTANCE = new WeatherManager();
+
+              public enum Type {
+                  CLEAR("Nice weather"),
+                  RAIN("Rain"),
+                  STORM("Thunderstorm"),
+                  FLOOD("Flood"),
+                  CLOUD_WALL("Cloud wall"),
+                  HAIL("Hail"),
+                  TORNADO("Tornado"),
+                  HURRICANE("Hurricane"),
+                  SNOWSTORM("Snow storm"),
+                  ICE("Freezing / ice");
+
+                  public final String label;
+
+                  Type(String label) {
+                      this.label = label;
+                  }
+
+                  public String id() {
+                      return name().toLowerCase(Locale.ROOT);
+                  }
+
+                  public static Type byId(String id) {
+                      String wanted = id.toLowerCase(Locale.ROOT);
+                      for (Type t : values()) {
+                          if (t.id().equals(wanted)) {
+                              return t;
+                          }
+                      }
+                      return null;
+                  }
+              }
+
+              public enum Climate {
+                  MILD, HOT, COLD
+              }
+
+              // ------------------------------------------------------------------ tuning
+              public static final float HAIL_DAMAGE = 10.0F;          // damage of one hailstone hit
+              private static final int HAIL_HIT_CHANCE = 5;           // every second, an exposed player has 1/5 chance to be hit
+              private static final double WALL_SPEED = 0.25;          // blocks per tick
+              private static final double WALL_HALF_WIDTH = 45.0;
+              private static final double WALL_HAIL_DISTANCE = 22.0;  // hail starts when the wall is this close
+              private static final double HAIL_DEPTH = 250.0;         // hail zone behind the wall
+              private static final double TORNADO_SPEED = 0.22;       // blocks per tick (players sprint faster)
+              private static final double TORNADO_RADIUS = 8.0;
+              private static final double TORNADO_MAX_LIFT = 14.0;    // blocks above ground
+              private static final boolean TORNADO_BREAKS_BLOCKS = true;
+              private static final int FLOOD_RADIUS = 26;
+              private static final int FLOOD_COLUMNS = 80;            // columns filled per player every 10 ticks
+              private static final int FLOOD_MAX_RISE = 7;            // blocks the water rises above the start level
+
+              // ------------------------------------------------------------------ state
+              private final RandomSource random = RandomSource.create();
+
+              private Type type = Type.CLEAR;
+              private Climate climate = Climate.MILD;
+              private boolean climateLocked = false;
+              private boolean auto = true;
+              private int ticksLeft = 20 * 120;
+              private int phaseTicks = 0;
+              private int lightningTimer = 60;
+
+              // cloud wall
+              private boolean wallActive = false;
+              private double wallX, wallZ, wallDirX, wallDirZ;
+
+              // tornado
+              private boolean tornadoActive = false;
+              private double torX, torZ, torDirX, torDirZ;
+
+              // flood
+              private int floodBaseY, floodY;
+
+              // everything we changed in the world, so we can put it back
+              private final ArrayDeque<Long> floodBlocks = new ArrayDeque<>();
+              private final ArrayDeque<Long> snowBlocks = new ArrayDeque<>();
+              private final ArrayDeque<Long> iceBlocks = new ArrayDeque<>();
+
+              private WeatherManager() {
+              }
+
+              // ------------------------------------------------------------------ public api
+              public boolean forceWeather(ServerLevel level, Type t) {
+                  List<ServerPlayer> players = level.players();
+                  if (players.isEmpty()) {
+                      return false;
+                  }
+                  begin(level, players, t);
+                  return true;
+              }
+
+              /** null = automatic climate */
+              public void setClimate(Climate c) {
+                  if (c == null) {
+                      climateLocked = false;
+                  } else {
+                      climate = c;
+                      climateLocked = true;
+                  }
+              }
+
+              public void setAuto(boolean on) {
+                  auto = on;
+              }
+
+              public void reset() {
+                  type = Type.CLEAR;
+                  climate = Climate.MILD;
+                  climateLocked = false;
+                  auto = true;
+                  ticksLeft = 20 * 120;
+                  phaseTicks = 0;
+                  wallActive = false;
+                  tornadoActive = false;
+                  floodBlocks.clear();
+                  snowBlocks.clear();
+                  iceBlocks.clear();
+              }
+
+              /** Immediately remove flood water, snow and ice we placed (used when the server stops). */
+              public void restoreAll(ServerLevel level) {
+                  drain(floodBlocks, level, Integer.MAX_VALUE, Blocks.WATER, Blocks.AIR.defaultBlockState());
+                  drain(snowBlocks, level, Integer.MAX_VALUE, Blocks.SNOW, Blocks.AIR.defaultBlockState());
+                  drain(iceBlocks, level, Integer.MAX_VALUE, Blocks.ICE, Blocks.WATER.defaultBlockState());
+              }
+
+              // ------------------------------------------------------------------ main tick
+              public void tick(ServerLevel level) {
+                  // put the world back after the weather that changed it is over
+                  if (type != Type.FLOOD) {
+                      drain(floodBlocks, level, 300, Blocks.WATER, Blocks.AIR.defaultBlockState());
+                  }
+                  if (type != Type.SNOWSTORM && type != Type.ICE) {
+                      drain(snowBlocks, level, 300, Blocks.SNOW, Blocks.AIR.defaultBlockState());
+                      drain(iceBlocks, level, 100, Blocks.ICE, Blocks.WATER.defaultBlockState());
+                  }
+
+                  List<ServerPlayer> players = level.players();
+                  if (players.isEmpty()) {
+                      return;
+                  }
+                  long time = level.getGameTime();
+                  phaseTicks++;
+
+                  if (auto) {
+                      ticksLeft--;
+                      if (ticksLeft <= 0) {
+                          nextPhase(level, players);
+                      }
+                  }
+
+                  switch (type) {
+                      case CLEAR, RAIN -> {
+                      }
+                      case STORM -> lightning(level, players, 60, 140);
+                      case CLOUD_WALL -> tickWall(level, players, time, true);
+                      case HAIL -> {
+                          tickWall(level, players, time, false);
+                          tickHail(level, players, time);
+                      }
+                      case TORNADO -> {
+                          tickTornado(level, players, time);
+                          lightning(level, players, 50, 110);
+                      }
+                      case HURRICANE -> {
+                          tickHurricane(level, players, time);
+                          lightning(level, players, 40, 90);
+                      }
+                      case FLOOD -> tickFlood(level, players, time);
+                      case SNOWSTORM -> tickSnowstorm(level, players, time);
+                      case ICE -> tickIce(level, players, time);
+                  }
+              }
+
+              // ------------------------------------------------------------------ phases
+              private void nextPhase(ServerLevel level, List<ServerPlayer> players) {
+                  switch (type) {
+                      case CLEAR -> {
+                          Climate old = climate;
+                          if (!climateLocked) {
+                              int r = random.nextInt(10);
+                              climate = r < 4 ? Climate.MILD : (r < 7 ? Climate.HOT : Climate.COLD);
+                          }
+                          if (old != climate) {
+                              broadcast(players, "The climate is now " + climate.name().toLowerCase(Locale.ROOT) + ".");
+                          }
+                          switch (climate) {
+                              case MILD -> begin(level, players, Type.RAIN);
+                              case HOT -> {
+                                  int r = random.nextInt(100);
+                                  if (r < 35) {
+                                      begin(level, players, Type.STORM);
+                                  } else if (r < 65) {
+                                      begin(level, players, Type.CLOUD_WALL);
+                                  } else if (r < 85) {
+                                      begin(level, players, Type.HURRICANE);
+                                  } else {
+                                      begin(level, players, Type.TORNADO);
+                                  }
+                              }
+                              case COLD -> begin(level, players, Type.SNOWSTORM);
+                          }
+                      }
+                      case RAIN -> begin(level, players, random.nextBoolean() ? Type.FLOOD : Type.CLEAR);
+                      case STORM -> begin(level, players, random.nextBoolean() ? Type.CLOUD_WALL : Type.CLEAR);
+                      case CLOUD_WALL -> begin(level, players, Type.HAIL);
+                      case HAIL -> begin(level, players, random.nextInt(10) < 6 ? Type.TORNADO : Type.CLEAR);
+                      case HURRICANE -> begin(level, players, random.nextInt(10) < 6 ? Type.FLOOD : Type.CLEAR);
+                      case SNOWSTORM -> begin(level, players, Type.ICE);
+                      case FLOOD, TORNADO, ICE -> begin(level, players, Type.CLEAR);
+                  }
+              }
+
+              private void begin(ServerLevel level, List<ServerPlayer> players, Type t) {
+                  startPhase(level, players, t, defaultTicks(t));
+              }
+
+              private int defaultTicks(Type t) {
+                  return switch (t) {
+                      case CLEAR -> seconds(120, 240);
+                      case RAIN -> seconds(80, 140);
+                      case STORM -> seconds(90, 150);
+                      case FLOOD -> seconds(150, 210);
+                      case CLOUD_WALL -> seconds(150, 180);
+                      case HAIL -> seconds(60, 80);
+                      case TORNADO -> seconds(100, 140);
+                      case HURRICANE -> seconds(180, 240);
+                      case SNOWSTORM -> seconds(120, 180);
+                      case ICE -> seconds(100, 150);
+                  };
+              }
+
+              private int seconds(int min, int max) {
+                  return (min + random.nextInt(max - min + 1)) * 20;
+              }
+
+              private void startPhase(ServerLevel level, List<ServerPlayer> players, Type t, int ticks) {
+                  type = t;
+                  ticksLeft = ticks;
+                  phaseTicks = 0;
+                  lightningTimer = 40;
+                  if (t != Type.CLOUD_WALL && t != Type.HAIL) {
+                      wallActive = false;
+                  }
+                  if (t != Type.TORNADO) {
+                      tornadoActive = false;
+                  }
+
+                  String message;
+                  switch (t) {
+                      case CLOUD_WALL -> {
+                          String from = startWall(players, 110);
+                          message = "A huge dark cloud wall is coming from the " + from + "! Hail follows behind it.";
+                      }
+                      case HAIL -> {
+                          if (!wallActive) {
+                              startWall(players, 15);
+                          }
+                          message = "HAIL! Get under a roof - a hailstone does " + (int) HAIL_DAMAGE + " damage.";
+                      }
+                      case TORNADO -> {
+                          String from = startTornado(players);
+                          message = "A TORNADO has formed to the " + from + "! Run or hide!";
+                      }
+                      case HURRICANE -> message = "A hurricane is hitting! Strong wind and lightning.";
+                      case FLOOD -> {
+                          startFlood(players);
+                          message = "Heavy rain is flooding the land! Go to high ground.";
+                      }
+                      case STORM -> message = "A thunderstorm is rolling in.";
+                      case RAIN -> message = "It starts to rain.";
+                      case SNOWSTORM -> message = "A snow storm is coming. It is freezing cold.";
+                      case ICE -> message = "Everything is freezing. Water turns to ice.";
+                      default -> message = "The sky clears up. Nice weather.";
+                  }
+
+                  applyVanillaWeather(level, t, ticks);
+                  broadcast(players, message);
+              }
+
+              /** Uses the normal /weather command so the visuals (rain, thunder, snow in cold biomes) are vanilla. */
+              private void applyVanillaWeather(ServerLevel level, Type t, int ticks) {
+                  String command = switch (t) {
+                      case RAIN, FLOOD, HAIL, SNOWSTORM -> "weather rain " + ticks;
+                      case STORM, HURRICANE, TORNADO -> "weather thunder " + ticks;
+                      default -> "weather clear " + ticks;
+                  };
+                  runCommand(level, command);
+              }
+
+              private void runCommand(ServerLevel level, String command) {
+                  MinecraftServer server = level.getServer();
+                  server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), command);
+              }
+
+              private void broadcast(List<ServerPlayer> players, String text) {
+                  Component message = Component.literal(text);
+                  for (ServerPlayer p : players) {
+                      p.sendSystemMessage(message);
+                  }
+              }
+
+              // ------------------------------------------------------------------ lightning
+              private void lightning(ServerLevel level, List<ServerPlayer> players, int minDelay, int maxDelay) {
+                  if (--lightningTimer > 0) {
+                      return;
+                  }
+                  lightningTimer = minDelay + random.nextInt(maxDelay - minDelay + 1);
+                  ServerPlayer p = players.get(random.nextInt(players.size()));
+                  double angle = random.nextDouble() * Math.PI * 2.0;
+                  double dist = 12.0 + random.nextDouble() * 30.0;
+                  int x = Mth.floor(p.getX() + Math.cos(angle) * dist);
+                  int z = Mth.floor(p.getZ() + Math.sin(angle) * dist);
+                  if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                      return;
+                  }
+                  int y = level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z);
+                  runCommand(level, String.format(Locale.ROOT, "summon minecraft:lightning_bolt %d %d %d", x, y, z));
+              }
+
+              // ------------------------------------------------------------------ cloud wall + hail
+              private String startWall(List<ServerPlayer> players, double distance) {
+                  ServerPlayer target = players.get(random.nextInt(players.size()));
+                  double angle = random.nextDouble() * Math.PI * 2.0;
+                  wallX = target.getX() + Math.cos(angle) * distance;
+                  wallZ = target.getZ() + Math.sin(angle) * distance;
+                  wallDirX = -Math.cos(angle);
+                  wallDirZ = -Math.sin(angle);
+                  wallActive = true;
+                  return compass(Math.cos(angle), Math.sin(angle));
+              }
+
+              private double[] nearestWallPoint(double px, double pz) {
+                  double perpX = -wallDirZ;
+                  double perpZ = wallDirX;
+                  double along = Mth.clamp((px - wallX) * perpX + (pz - wallZ) * perpZ, -WALL_HALF_WIDTH, WALL_HALF_WIDTH);
+                  return new double[] { wallX + perpX * along, wallZ + perpZ * along };
+              }
+
+              private double distToWall(double px, double pz) {
+                  double[] c = nearestWallPoint(px, pz);
+                  return Math.hypot(px - c[0], pz - c[1]);
+              }
+
+              private boolean inHailZone(double px, double pz) {
+                  if (!wallActive) {
+                      return false;
+                  }
+                  double dx = px - wallX;
+                  double dz = pz - wallZ;
+                  double ahead = dx * wallDirX + dz * wallDirZ;           // > 0 = wall has not reached us yet
+                  double lateral = Math.abs(dx * -wallDirZ + dz * wallDirX);
+                  return ahead <= WALL_HAIL_DISTANCE && ahead >= -HAIL_DEPTH && lateral <= WALL_HALF_WIDTH + 20.0;
+              }
+
+              private void tickWall(ServerLevel level, List<ServerPlayer> players, long time, boolean triggerHail) {
+                  if (!wallActive) {
+                      return;
+                  }
+                  wallX += wallDirX * WALL_SPEED;
+                  wallZ += wallDirZ * WALL_SPEED;
+                  double perpX = -wallDirZ;
+                  double perpZ = wallDirX;
+
+                  for (ServerPlayer p : players) {
+                      double dist = distToWall(p.getX(), p.getZ());
+                      if (triggerHail && dist <= WALL_HAIL_DISTANCE) {
+                          begin(level, players, Type.HAIL);
+                          return;
+                      }
+                      if (time % 2 == 0 && dist < 40.0) {
+                          for (int i = 0; i < 10; i++) {
+                              double t = (random.nextDouble() * 2.0 - 1.0) * WALL_HALF_WIDTH;
+                              double x = wallX + perpX * t;
+                              double z = wallZ + perpZ * t;
+                              if (Math.hypot(x - p.getX(), z - p.getZ()) > 34.0) {
+                                  continue;
+                              }
+                              double y = p.getY() + 3.0 + random.nextDouble() * 32.0;
+                              level.sendParticles(ParticleTypes.LARGE_SMOKE, x, y, z, 3, 3.0, 3.0, 3.0, 0.0);
+                          }
+                      }
+                  }
+              }
+
+              private void tickHail(ServerLevel level, List<ServerPlayer> players, long time) {
+                  for (ServerPlayer p : players) {
+                      if (p.isSpectator() || !inHailZone(p.getX(), p.getZ())) {
+                          continue;
+                      }
+                      if (!level.canSeeSky(p.blockPosition())) {
+                          continue; // under a roof = safe
+                      }
+                      if (time % 2 == 0) {
+                          for (int i = 0; i < 8; i++) {
+                              double x = p.getX() + (random.nextDouble() - 0.5) * 20.0;
+                              double z = p.getZ() + (random.nextDouble() - 0.5) * 20.0;
+                              double y = p.getY() + 8.0 + random.nextDouble() * 6.0;
+                              // count = 0 -> the offsets are used as the particle velocity (straight down)
+                              level.sendParticles(ParticleTypes.ITEM_SNOWBALL, x, y, z, 0, 0.0, -1.0, 0.0, 0.9);
+                          }
+                      }
+                      if (time % 20 == 0 && random.nextInt(HAIL_HIT_CHANCE) == 0) {
+                          p.hurtServer(level, level.damageSources().generic(), HAIL_DAMAGE);
+                          p.sendSystemMessage(Component.literal("Ouch! A hailstone hit you!"));
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ tornado
+              private String startTornado(List<ServerPlayer> players) {
+                  ServerPlayer target = players.get(random.nextInt(players.size()));
+                  double angle = random.nextDouble() * Math.PI * 2.0;
+                  torX = target.getX() + Math.cos(angle) * 60.0;
+                  torZ = target.getZ() + Math.sin(angle) * 60.0;
+                  torDirX = -Math.cos(angle);
+                  torDirZ = -Math.sin(angle);
+                  tornadoActive = true;
+                  return compass(Math.cos(angle), Math.sin(angle));
+              }
+
+              private ServerPlayer nearestPlayer(List<ServerPlayer> players, double x, double z) {
+                  ServerPlayer best = players.get(0);
+                  double bestDist = Double.MAX_VALUE;
+                  for (ServerPlayer p : players) {
+                      double d = Math.hypot(p.getX() - x, p.getZ() - z);
+                      if (d < bestDist) {
+                          bestDist = d;
+                          best = p;
+                      }
+                  }
+                  return best;
+              }
+
+              private void tickTornado(ServerLevel level, List<ServerPlayer> players, long time) {
+                  if (!tornadoActive) {
+                      return;
+                  }
+                  // drift slowly towards the nearest player, with some wobble
+                  ServerPlayer nearest = nearestPlayer(players, torX, torZ);
+                  double dx = nearest.getX() - torX;
+                  double dz = nearest.getZ() - torZ;
+                  double len = Math.max(1.0, Math.hypot(dx, dz));
+                  torDirX = Mth.lerp(0.012, torDirX, dx / len) + (random.nextDouble() - 0.5) * 0.08;
+                  torDirZ = Mth.lerp(0.012, torDirZ, dz / len) + (random.nextDouble() - 0.5) * 0.08;
+                  double dirLen = Math.hypot(torDirX, torDirZ);
+                  if (dirLen > 1.0E-6) {
+                      torDirX /= dirLen;
+                      torDirZ /= dirLen;
+                  }
+                  torX += torDirX * TORNADO_SPEED;
+                  torZ += torDirZ * TORNADO_SPEED;
+
+                  int bx = Mth.floor(torX);
+                  int bz = Mth.floor(torZ);
+                  if (!level.hasChunkAt(new BlockPos(bx, 64, bz))) {
+                      return;
+                  }
+                  int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
+
+                  // funnel made of smoke
+                  if (time % 2 == 0) {
+                      for (int h = 0; h <= 42; h += 3) {
+                          double radius = 1.2 + h * 0.18;
+                          for (int k = 0; k < 4; k++) {
+                              double a = time * 0.35 + h * 0.4 + k * (Math.PI / 2.0);
+                              level.sendParticles(ParticleTypes.LARGE_SMOKE,
+                                      torX + Math.cos(a) * radius, groundY + h, torZ + Math.sin(a) * radius,
+                                      1, 0.2, 0.2, 0.2, 0.0);
+                          }
+                      }
+                      level.sendParticles(ParticleTypes.CLOUD, torX, groundY + 44, torZ, 8, 6.0, 1.5, 6.0, 0.0);
+                  }
+
+                  // lift and spin everything close to it
+                  AABB box = new AABB(torX - TORNADO_RADIUS, groundY - 4, torZ - TORNADO_RADIUS,
+                          torX + TORNADO_RADIUS, groundY + 50, torZ + TORNADO_RADIUS);
+                  for (LivingEntity e : level.getEntitiesOfClass(LivingEntity.class, box)) {
+                      if (e.isSpectator()) {
+                          continue;
+                      }
+                      double ex = torX - e.getX();
+                      double ez = torZ - e.getZ();
+                      double d = Math.max(0.5, Math.hypot(ex, ez));
+                      if (d > TORNADO_RADIUS) {
+                          continue;
+                      }
+                      // swirl around + a little inward pull
+                      e.push((ez / d) * 0.06 + (ex / d) * 0.025, 0.0, (-ex / d) * 0.06 + (ez / d) * 0.025);
+                      if (e.getY() < groundY + TORNADO_MAX_LIFT) {
+                          e.addEffect(new MobEffectInstance(MobEffects.LEVITATION, 25, 3, false, false));
+                      }
+                  }
+
+                  // rip weak blocks (leaves, grass, flowers, glass...) out of the ground
+                  if (TORNADO_BREAKS_BLOCKS && time % 4 == 0) {
+                      for (int i = 0; i < 12; i++) {
+                          double a = random.nextDouble() * Math.PI * 2.0;
+                          double r = random.nextDouble() * 4.0;
+                          BlockPos bp = BlockPos.containing(torX + Math.cos(a) * r, groundY + random.nextInt(6) - 1, torZ + Math.sin(a) * r);
+                          if (!level.hasChunkAt(bp)) {
+                              continue;
+                          }
+                          BlockState s = level.getBlockState(bp);
+                          if (s.isAir() || !s.getFluidState().isEmpty()) {
+                              continue;
+                          }
+                          float hardness = s.getDestroySpeed(level, bp);
+                          if (hardness >= 0.0F && hardness <= 0.5F) {
+                              level.destroyBlock(bp, false);
+                          }
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ hurricane
+              private void tickHurricane(ServerLevel level, List<ServerPlayer> players, long time) {
+                  double windAngle = time * 0.0015;
+                  double wx = Math.cos(windAngle);
+                  double wz = Math.sin(windAngle);
+                  for (ServerPlayer p : players) {
+                      if (p.isSpectator()) {
+                          continue;
+                      }
+                      if (time % 2 == 0 && level.canSeeSky(p.blockPosition())) {
+                          p.push(wx * 0.05, 0.0, wz * 0.05); // wind pushes you around when you are outside
+                      }
+                      if (time % 3 == 0) {
+                          for (int arm = 0; arm < 3; arm++) {
+                              for (int r = 6; r <= 30; r += 4) {
+                                  double a = time * 0.05 + r * 0.14 + arm * (Math.PI * 2.0 / 3.0);
+                                  level.sendParticles(ParticleTypes.LARGE_SMOKE,
+                                          p.getX() + Math.cos(a) * r, p.getY() + 20.0 + r * 0.2, p.getZ() + Math.sin(a) * r,
+                                          2, 1.5, 0.7, 1.5, 0.0);
+                              }
+                          }
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ flood
+              private void startFlood(List<ServerPlayer> players) {
+                  int lowest = Integer.MAX_VALUE;
+                  for (ServerPlayer p : players) {
+                      lowest = Math.min(lowest, p.blockPosition().getY());
+                  }
+                  floodBaseY = lowest - 1;
+                  floodY = floodBaseY;
+              }
+
+              private void tickFlood(ServerLevel level, List<ServerPlayer> players, long time) {
+                  if (phaseTicks % 120 == 0 && floodY < floodBaseY + FLOOD_MAX_RISE) {
+                      floodY++;
+                  }
+                  if (time % 10 != 0) {
+                      return;
+                  }
+                  for (ServerPlayer p : players) {
+                      for (int i = 0; i < FLOOD_COLUMNS; i++) {
+                          int x = Mth.floor(p.getX()) + random.nextInt(FLOOD_RADIUS * 2 + 1) - FLOOD_RADIUS;
+                          int z = Mth.floor(p.getZ()) + random.nextInt(FLOOD_RADIUS * 2 + 1) - FLOOD_RADIUS;
+                          if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                              continue;
+                          }
+                          int y = level.getHeight(Heightmap.Types.OCEAN_FLOOR, x, z);
+                          BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, y, z);
+                          while (pos.getY() <= floodY) {
+                              BlockState s = level.getBlockState(pos);
+                              if (s.getFluidState().is(FluidTags.WATER)) {
+                                  pos.move(Direction.UP); // already wet, look one higher
+                                  continue;
+                              }
+                              if (s.isAir() || s.canBeReplaced()) {
+                                  level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
+                                  floodBlocks.addLast(pos.asLong());
+                              }
+                              break;
+                          }
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ snow storm + ice
+              private void tickSnowstorm(ServerLevel level, List<ServerPlayer> players, long time) {
+                  for (ServerPlayer p : players) {
+                      if (time % 2 == 0) {
+                          level.sendParticles(ParticleTypes.SNOWFLAKE, p.getX(), p.getY() + 7.0, p.getZ(), 30, 12.0, 4.0, 12.0, 0.03);
+                      }
+                      // freezing like powder snow - leather armor protects
+                      if (!p.isSpectator() && level.canSeeSky(p.blockPosition())) {
+                          p.setTicksFrozen(Math.min(p.getTicksFrozen() + 3, p.getTicksRequiredToFreeze() + 40));
+                      }
+                      if (time % 10 == 0) {
+                          for (int i = 0; i < 30; i++) {
+                              int x = Mth.floor(p.getX()) + random.nextInt(57) - 28;
+                              int z = Mth.floor(p.getZ()) + random.nextInt(57) - 28;
+                              if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                                  continue;
+                              }
+                              int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
+                              BlockPos pos = new BlockPos(x, y, z);
+                              BlockState snow = Blocks.SNOW.defaultBlockState();
+                              if (level.getBlockState(pos).isAir() && snow.canSurvive(level, pos)) {
+                                  level.setBlockAndUpdate(pos, snow);
+                                  snowBlocks.addLast(pos.asLong());
+                              }
+                          }
+                      }
+                  }
+              }
+
+              private void tickIce(ServerLevel level, List<ServerPlayer> players, long time) {
+                  if (time % 10 != 0) {
+                      return;
+                  }
+                  for (ServerPlayer p : players) {
+                      for (int i = 0; i < 40; i++) {
+                          int x = Mth.floor(p.getX()) + random.nextInt(69) - 34;
+                          int z = Mth.floor(p.getZ()) + random.nextInt(69) - 34;
+                          if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                              continue;
+                          }
+                          int y = level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z) - 1;
+                          BlockPos pos = new BlockPos(x, y, z);
+                          BlockState s = level.getBlockState(pos);
+                          if (s.is(Blocks.WATER) && s.getFluidState().isSource()) {
+                              level.setBlockAndUpdate(pos, Blocks.ICE.defaultBlockState());
+                              iceBlocks.addLast(pos.asLong());
+                          }
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ cleanup helper
+              private static void drain(ArrayDeque<Long> queue, ServerLevel level, int perTick, Block expected, BlockState replacement) {
+                  int done = 0;
+                  while (done < perTick && !queue.isEmpty()) {
+                      done++;
+                      BlockPos pos = BlockPos.of(queue.pollLast());
+                      if (!level.hasChunkAt(pos)) {
+                          continue;
+                      }
+                      if (level.getBlockState(pos).is(expected)) {
+                          level.setBlockAndUpdate(pos, replacement);
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ radar text
+              private static final String[] DIRECTIONS = { "E", "SE", "S", "SW", "W", "NW", "N", "NE" };
+
+              /** dx/dz = vector from you to the thing. +x = east, +z = south. */
+              public static String compass(double dx, double dz) {
+                  double degrees = Math.toDegrees(Math.atan2(dz, dx));
+                  int index = Math.floorMod((int) Math.round(degrees / 45.0), 8);
+                  return DIRECTIONS[index];
+              }
+
+              public List<String> radarReport(double rx, double rz) {
+                  List<String> out = new ArrayList<>();
+                  out.add("=== Weather Radar ===");
+                  out.add("Weather: " + type.label + (auto ? " (" + Math.max(0, ticksLeft / 20) + "s left)" : " (locked)"));
+                  out.add("Climate: " + climate.name().toLowerCase(Locale.ROOT) + (climateLocked ? " (locked)" : ""));
+                  if (wallActive && (type == Type.CLOUD_WALL || type == Type.HAIL)) {
+                      double[] c = nearestWallPoint(rx, rz);
+                      long dist = Math.round(Math.hypot(c[0] - rx, c[1] - rz));
+                      out.add("Cloud wall: " + dist + " blocks " + compass(c[0] - rx, c[1] - rz)
+                              + (type == Type.CLOUD_WALL ? " - hail behind it!" : " - hail zone"));
+                  }
+                  if (tornadoActive && type == Type.TORNADO) {
+                      long dist = Math.round(Math.hypot(torX - rx, torZ - rz));
+                      out.add("TORNADO: " + dist + " blocks " + compass(torX - rx, torZ - rz) + " - take cover!");
+                  }
+                  switch (type) {
+                      case HURRICANE -> out.add("Hurricane: strong wind and lightning, stay inside.");
+                      case FLOOD -> out.add("Flood: water is rising, go to high ground.");
+                      case SNOWSTORM, ICE -> out.add("Cold: water freezes. Leather armor protects against freezing.");
+                      default -> {
+                      }
+                  }
+                  return out;
+              }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/java/com/palweathers
+          cat > src/main/java/com/palweathers/WeatherCommands.java <<'PALWEATHERS_EOF'
+          package com.palweathers;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+
+          import com.mojang.brigadier.CommandDispatcher;
+          import com.mojang.brigadier.arguments.BoolArgumentType;
+          import com.mojang.brigadier.arguments.StringArgumentType;
+
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.commands.Commands;
+          import net.minecraft.commands.SharedSuggestionProvider;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.level.ServerLevel;
+
+          /**
+           * /wx set <type>          - start a weather type now (clear, rain, storm, flood, cloud_wall, hail, tornado, hurricane, snowstorm, ice)
+           * /wx climate <mode>      - mild | hot | cold | auto
+           * /wx auto <true|false>   - false = the current weather never ends by itself
+           * /wx status              - show what is happening
+           *
+           * NOTE: no permission check is added here (permission API changed between Minecraft versions).
+           * On a public server add .requires(...) to the "wx" literal.
+           */
+          public final class WeatherCommands {
+              private WeatherCommands() {
+              }
+
+              public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
+                  dispatcher.register(Commands.literal("wx")
+                          .then(Commands.literal("set")
+                                  .then(Commands.argument("type", StringArgumentType.word())
+                                          .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(typeIds(), builder))
+                                          .executes(ctx -> setWeather(ctx.getSource(), StringArgumentType.getString(ctx, "type")))))
+                          .then(Commands.literal("climate")
+                                  .then(Commands.argument("mode", StringArgumentType.word())
+                                          .suggests((ctx, builder) -> SharedSuggestionProvider.suggest(List.of("mild", "hot", "cold", "auto"), builder))
+                                          .executes(ctx -> setClimate(ctx.getSource(), StringArgumentType.getString(ctx, "mode")))))
+                          .then(Commands.literal("auto")
+                                  .then(Commands.argument("on", BoolArgumentType.bool())
+                                          .executes(ctx -> setAuto(ctx.getSource(), BoolArgumentType.getBool(ctx, "on")))))
+                          .then(Commands.literal("status")
+                                  .executes(ctx -> status(ctx.getSource()))));
+              }
+
+              private static List<String> typeIds() {
+                  List<String> ids = new ArrayList<>();
+                  for (WeatherManager.Type t : WeatherManager.Type.values()) {
+                      ids.add(t.id());
+                  }
+                  return ids;
+              }
+
+              private static int setWeather(CommandSourceStack source, String id) {
+                  WeatherManager.Type type = WeatherManager.Type.byId(id);
+                  if (type == null) {
+                      source.sendFailure(Component.literal("Unknown weather: " + id));
+                      return 0;
+                  }
+                  ServerLevel overworld = source.getServer().overworld();
+                  if (!WeatherManager.INSTANCE.forceWeather(overworld, type)) {
+                      source.sendFailure(Component.literal("Nobody is online in the overworld."));
+                      return 0;
+                  }
+                  source.sendSuccess(() -> Component.literal("Weather: " + type.label), true);
+                  return 1;
+              }
+
+              private static int setClimate(CommandSourceStack source, String mode) {
+                  String m = mode.toLowerCase(Locale.ROOT);
+                  switch (m) {
+                      case "auto" -> WeatherManager.INSTANCE.setClimate(null);
+                      case "mild" -> WeatherManager.INSTANCE.setClimate(WeatherManager.Climate.MILD);
+                      case "hot" -> WeatherManager.INSTANCE.setClimate(WeatherManager.Climate.HOT);
+                      case "cold" -> WeatherManager.INSTANCE.setClimate(WeatherManager.Climate.COLD);
+                      default -> {
+                          source.sendFailure(Component.literal("Use: mild, hot, cold or auto"));
+                          return 0;
+                      }
+                  }
+                  source.sendSuccess(() -> Component.literal("Climate: " + m), true);
+                  return 1;
+              }
+
+              private static int setAuto(CommandSourceStack source, boolean on) {
+                  WeatherManager.INSTANCE.setAuto(on);
+                  source.sendSuccess(() -> Component.literal(on ? "Weather changes by itself again." : "Weather is locked (never ends by itself)."), true);
+                  return 1;
+              }
+
+              private static int status(CommandSourceStack source) {
+                  for (String line : WeatherManager.INSTANCE.radarReport(source.getPosition().x, source.getPosition().z)) {
+                      source.sendSuccess(() -> Component.literal(line), false);
+                  }
+                  return 1;
+              }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/java/com/palweathers
+          cat > src/main/java/com/palweathers/RadarBlock.java <<'PALWEATHERS_EOF'
+          package com.palweathers;
+
+          import com.mojang.serialization.MapCodec;
+
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.InteractionResult;
+          import net.minecraft.world.entity.player.Player;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.block.Block;
+          import net.minecraft.world.level.block.state.BlockBehaviour;
+          import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.phys.BlockHitResult;
+
+          /** Weather Radar: right-click it to see current weather, climate, cloud wall and tornado distance/direction. */
+          public class RadarBlock extends Block {
+              public static final MapCodec<RadarBlock> CODEC = simpleCodec(RadarBlock::new);
+
+              public RadarBlock(BlockBehaviour.Properties properties) {
+                  super(properties);
+              }
+
+              @Override
+              protected MapCodec<RadarBlock> codec() {
+                  return CODEC;
+              }
+
+              @Override
+              protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {
+                  if (level instanceof ServerLevel && player instanceof ServerPlayer serverPlayer) {
+                      for (String line : WeatherManager.INSTANCE.radarReport(pos.getX() + 0.5, pos.getZ() + 0.5)) {
+                          serverPlayer.sendSystemMessage(Component.literal(line));
+                      }
+                  }
+                  return InteractionResult.SUCCESS;
+              }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/resources/assets/palweathers/blockstates
+          cat > src/main/resources/assets/palweathers/blockstates/weather_radar.json <<'PALWEATHERS_EOF'
+          {
+            "variants": {
+              "": { "model": "palweathers:block/weather_radar" }
+            }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/resources/assets/palweathers/models/block
+          cat > src/main/resources/assets/palweathers/models/block/weather_radar.json <<'PALWEATHERS_EOF'
+          {
+            "parent": "minecraft:block/cube_column",
+            "textures": {
+              "end": "minecraft:block/target_top",
+              "side": "minecraft:block/target_side"
+            }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/resources/assets/palweathers/items
+          cat > src/main/resources/assets/palweathers/items/weather_radar.json <<'PALWEATHERS_EOF'
+          {
+            "model": {
+              "type": "minecraft:model",
+              "model": "palweathers:block/weather_radar"
+            }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/resources/assets/palweathers/lang
+          cat > src/main/resources/assets/palweathers/lang/en_us.json <<'PALWEATHERS_EOF'
+          {
+            "block.palweathers.weather_radar": "Weather Radar"
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/resources/data/palweathers/recipe
+          cat > src/main/resources/data/palweathers/recipe/weather_radar.json <<'PALWEATHERS_EOF'
+          {
+            "type": "minecraft:crafting_shaped",
+            "category": "misc",
+            "pattern": [
+              "ILI",
+              "IRI",
+              "III"
+            ],
+            "key": {
+              "I": "minecraft:iron_ingot",
+              "L": "minecraft:lightning_rod",
+              "R": "minecraft:redstone"
+            },
+            "result": {
+              "id": "palweathers:weather_radar",
+              "count": 1
+            }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/resources/META-INF
+          cat > src/main/resources/META-INF/neoforge.mods.toml <<'PALWEATHERS_EOF'
+          modLoader = "javafml"
+          loaderVersion = "[1,)"
+          license = "MIT"
+
+          [[mods]]
+          modId = "palweathers"
+          version = "1.0.0"
+          displayName = "Palweathers"
+          iconFile = "logo.png"
+          authors = "Palweathers"
+          description = '''
+          Real weather for Minecraft: rain, floods, thunderstorms, a cloud wall with hail,
+          tornadoes, hurricanes, snow storms and freezing ice. Craft a Weather Radar block to see what is coming.
+          Commands: /wx set <weather>, /wx climate <hot|cold|mild|auto>, /wx status
+          '''
+
+          [[dependencies.palweathers]]
+          modId = "neoforge"
+          type = "required"
+          versionRange = "[26.3,)"
+          ordering = "NONE"
+          side = "BOTH"
+
+          [[dependencies.palweathers]]
+          modId = "minecraft"
+          type = "required"
+          versionRange = "[26.3,26.4)"
+          ordering = "NONE"
+          side = "BOTH"
+          PALWEATHERS_EOF
+          mkdir -p src/main/resources
+          base64 -d > src/main/resources/logo.png <<'PALWEATHERS_EOF'
+          iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAMAAABrrFhUAAAAwFBMVEWsqcuFhqV4epJvdIpna4Vf
+          Y3pWXXJRV2pOUWFHT11KSE9DSFQ+Rlc8Rj87QVA3QTlKOCw/NzU4Pkg4OD4zO0gyPDIyNkUyNDYt
+          ODwsOSotMz0oMjUrOSIoNSAnMyAkMh07LSQwKiUpLzcpKCYkLi8jLxojKjYjJykeKjgfJzMfKSQd
+          JDIdJCggLBgeKhccJhcZJBUlHxceHx8ZICoZHx0VHSkWGyIWIBIUHBMdGRIWGR4TGSASGBcXFhMQ
+          FRoTExFJd7B8AABscElEQVR42pW9CUPiTNM1zKWyb2NYwhoEAoxhFVAQt///r746p6qToM79vF9m
+          XECF1OmqU0tXd2du/rPrRq7bfK3ZbLbb7V6vN5nM5Xp8XPK/XvNHeWbOH8zxcM4P/TKfT3q9Nv64
+          3WzWanih1KWv2Y6vHq5a095GXmu5Wq2Wy+VBrufnF1xvb4fnN16Ht8+3T7vk4een/k+eekk9wrVM
+          Pz58fj5f/VReFU/qlbmNpScAFXezk4neWiy8AwCSzhWCee9xrgDw2YnIL38t/7xaLHYsMGWWb9oO
+          XweAAr3ktVoBAJX/xQC4CAB6mbifn98Efnn7BsDhfwIgv/62jAG4+y+NQK5SiwFomwo88uYUAL16
+          Tuh2SnpVAIot/3t6TXrXFwDoqXoBAAUagOI9Hg0AQ+D55fDiNOAtJSLGz1TgzUn0+T8AeP58u9KI
+          z7eX5xQA2dv/kusmWxQEbIjappy8likFEADmOvTtuYOFslIBaAWq2aopk94EAE0w6KoKOui9Sa09
+          mThNe4T8pgG4Xp4fBQBFwHB4u1wAhAGQWMHbZ/oRrsdrAJ7b7vGLPvP8kgIge0saUC64zRcqXlMB
+          6KUBMAXQu+3FJpACgOPLsde/dJqSXACAOvENgN6kOVGUBQSqgOjA82GuXJAC4POiFCAAKCu8JEC8
+          vfwLgM8UAGoLQDcGIJe7u6EJmArki7VmSgOuEXjsNXu8dZOwbVwo3/WMAXvz2HAee/Mr9KgM1ART
+          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
+          PALWEATHERS_EOF
+          find . -type f | sort
+
+      - name: Get the NeoForge template
+        run: |
+          set -e
+          for name in MDK-26.3-ModDevGradle MDK-26.2-ModDevGradle; do
+            if git clone --depth 1 "https://github.com/NeoForgeMDKs/$name.git" mdk; then
+              echo "Using template $name"
+              break
+            fi
+          done
+          test -d mdk
+          rm -rf mdk/.git mdk/src/main/java mdk/src/main/templates mdk/src/generated
+          find mdk/src -type d -name examplemod -prune -exec rm -rf {} +
+          find mdk/src -name neoforge.mods.toml -delete
+          cp -r modsrc/src/main mdk/src/
+          cd mdk
+          sed -i -E 's/^mod_id *=.*/mod_id=palweathers/' gradle.properties
+          sed -i -E 's/^mod_name *=.*/mod_name=Palweathers/' gradle.properties
+          sed -i -E 's/^mod_version *=.*/mod_version=1.0.0/' gradle.properties
+          sed -i -E 's/^mod_group_id *=.*/mod_group_id=com.palweathers/' gradle.properties
+          sed -i -E 's/^mod_authors *=.*/mod_authors=Palweathers/' gradle.properties
+          sed -i -E 's/^minecraft_version *=.*/minecraft_version=26.3/' gradle.properties
+          sed -i -E "s/(id ['\"]net\.neoforged\.moddev['\"] version ['\"])[^'\"]+/\12.0.147/" build.gradle
+          echo "---- gradle.properties ----"
+          cat gradle.properties
+          echo "---- build.gradle plugins ----"
+          grep -n "moddev" build.gradle || true
+
+      - name: Build the jar
+        working-directory: mdk
+        run: |
+          chmod +x gradlew
+          ok=0
+          for v in 26.3.0.7-beta 26.3.0.6-beta; do
+            echo "=== Trying NeoForge $v ==="
+            sed -i -E "s/^neo_version *=.*/neo_version=$v/" gradle.properties
+            if ./gradlew build --no-daemon --stacktrace; then
+              ok=1
+              break
+            fi
+          done
+          test "$ok" = 1
+          ls -la build/libs
+
+      - name: Save the jar so you can download it
+        uses: actions/upload-artifact@v4
+        with:
+          name: palweathers-jar
+          path: mdk/build/libs/*.jar
