@@ -29,7 +29,6 @@ jobs:
           import net.minecraft.world.item.BlockItem;
           import net.minecraft.world.item.CreativeModeTabs;
           import net.minecraft.world.level.block.SoundType;
-          import net.minecraft.world.level.block.state.BlockBehaviour;
           import net.neoforged.bus.api.IEventBus;
           import net.neoforged.fml.common.Mod;
           import net.neoforged.neoforge.common.NeoForge;
@@ -53,7 +52,7 @@ jobs:
               public static final DeferredBlock<RadarBlock> RADAR_BLOCK = BLOCKS.registerBlock(
                       "weather_radar",
                       RadarBlock::new,
-                      BlockBehaviour.Properties.of().strength(3.0F).sound(SoundType.METAL));
+                      props -> props.strength(3.0F).sound(SoundType.METAL));
 
               public static final DeferredItem<BlockItem> RADAR_ITEM =
                       ITEMS.registerSimpleBlockItem("weather_radar", RADAR_BLOCK);
@@ -940,8 +939,6 @@ jobs:
           cat > src/main/java/com/palweathers/RadarBlock.java <<'PALWEATHERS_EOF'
           package com.palweathers;
 
-          import com.mojang.serialization.MapCodec;
-
           import net.minecraft.core.BlockPos;
           import net.minecraft.network.chat.Component;
           import net.minecraft.server.level.ServerLevel;
@@ -956,15 +953,8 @@ jobs:
 
           /** Weather Radar: right-click it to see current weather, climate, cloud wall and tornado distance/direction. */
           public class RadarBlock extends Block {
-              public static final MapCodec<RadarBlock> CODEC = simpleCodec(RadarBlock::new);
-
               public RadarBlock(BlockBehaviour.Properties properties) {
                   super(properties);
-              }
-
-              @Override
-              protected MapCodec<RadarBlock> codec() {
-                  return CODEC;
               }
 
               @Override
