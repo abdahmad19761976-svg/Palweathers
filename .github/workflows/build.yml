@@ -116,16 +116,22 @@ jobs:
 
           import java.util.ArrayDeque;
           import java.util.ArrayList;
+          import java.util.HashMap;
+          import java.util.HashSet;
+          import java.util.Iterator;
           import java.util.List;
           import java.util.Locale;
+          import java.util.Map;
 
           import net.minecraft.core.BlockPos;
           import net.minecraft.core.Direction;
           import net.minecraft.core.particles.ParticleTypes;
+          import net.minecraft.core.particles.SimpleParticleType;
           import net.minecraft.network.chat.Component;
           import net.minecraft.server.MinecraftServer;
           import net.minecraft.server.level.ServerLevel;
           import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.tags.BlockTags;
           import net.minecraft.tags.FluidTags;
           import net.minecraft.util.Mth;
           import net.minecraft.util.RandomSource;
@@ -135,6 +141,7 @@ jobs:
           import net.minecraft.world.level.block.Block;
           import net.minecraft.world.level.block.Blocks;
           import net.minecraft.world.level.block.state.BlockState;
+          import net.minecraft.world.level.block.state.properties.BlockStateProperties;
           import net.minecraft.world.level.levelgen.Heightmap;
           import net.minecraft.world.phys.AABB;
 
@@ -143,8 +150,8 @@ jobs:
            *
            * Climate decides what can happen:
            *   MILD: nice weather -> rain -> (flood)
-           *   HOT : storm, cloud wall -> hail -> tornado, hurricane
-           *   COLD: snow storm -> ice (water freezes)
+           *   HOT : steam rises from water -> storm -> cloud wall -> hail -> tornado (EF scale), hurricane, flood
+           *   COLD: snow storm (snow piles up) -> ice -> sun comes out and everything melts
            */
           public final class WeatherManager {
               public static final WeatherManager INSTANCE = new WeatherManager();
@@ -159,7 +166,8 @@ jobs:
                   TORNADO("Tornado"),
                   HURRICANE("Hurricane"),
                   SNOWSTORM("Snow storm"),
-                  ICE("Freezing / ice");
+                  ICE("Freezing / ice"),
+                  THAW("Sun and melting");
 
                   public final String label;
 
@@ -187,19 +195,40 @@ jobs:
               }
 
               // ------------------------------------------------------------------ tuning
-              public static final float HAIL_DAMAGE = 10.0F;          // damage of one hailstone hit
-              private static final int HAIL_HIT_CHANCE = 5;           // every second, an exposed player has 1/5 chance to be hit
+              public static final float HAIL_DAMAGE = 3.0F;           // damage of one hailstone hit
+              private static final int HAIL_AIM_CHANCE = 4;           // every second an exposed player has 1/4 chance to be aimed at
+              private static final int HAIL_FALL_TICKS = 14;
+              private static final int HAIL_MAX_IN_FLIGHT = 120;
               private static final double WALL_SPEED = 0.25;          // blocks per tick
               private static final double WALL_HALF_WIDTH = 45.0;
               private static final double WALL_HAIL_DISTANCE = 22.0;  // hail starts when the wall is this close
               private static final double HAIL_DEPTH = 250.0;         // hail zone behind the wall
               private static final double TORNADO_SPEED = 0.22;       // blocks per tick (players sprint faster)
-              private static final double TORNADO_RADIUS = 8.0;
-              private static final double TORNADO_MAX_LIFT = 14.0;    // blocks above ground
-              private static final boolean TORNADO_BREAKS_BLOCKS = true;
-              private static final int FLOOD_RADIUS = 26;
-              private static final int FLOOD_COLUMNS = 80;            // columns filled per player every 10 ticks
-              private static final int FLOOD_MAX_RISE = 7;            // blocks the water rises above the start level
+              private static final int TORNADO_FORM_TICKS = 200;      // the funnel needs 10 seconds to touch the ground
+              public static final int MIN_WIND = 45;
+              public static final int MAX_WIND = 400;                 // mph
+              public static final int MIN_WIDTH = 20;
+              public static final int MAX_WIDTH = 1000;               // blocks
+              private static final int FLOOD_COLUMNS = 120;           // columns filled every 10 ticks
+              private static final double FLOOD_RISE_PER_TICK = 0.1 / 20.0; // water rises 0.1 block every second
+              private static final int FLOOD_MAX_RISE = 10;
+              private static final int SNOW_MAX_LAYERS = 6;
+              private static final int RADAR_SIZE = 10;               // radar cells on each side of the block
+              private static final double RADAR_CELL = 16.0;          // blocks in the world per radar cell
+              private static final double RADAR_SPACING = 0.45;       // blocks between radar dots in the air
+              private static final long RADAR_ON_TICKS = 20L * 120L;  // radar screen stays on for 2 minutes
+
+              // radar colors: 1 green, 2 yellow, 3 orange, 4 red, 5 purple, 6 blue, 7 white
+              private static final SimpleParticleType[] RADAR_PARTICLES = {
+                      ParticleTypes.POOF,
+                      ParticleTypes.HAPPY_VILLAGER,
+                      ParticleTypes.WAX_ON,
+                      ParticleTypes.FLAME,
+                      ParticleTypes.CRIMSON_SPORE,
+                      ParticleTypes.WITCH,
+                      ParticleTypes.SOUL_FIRE_FLAME,
+                      ParticleTypes.END_ROD
+              };
 
               // ------------------------------------------------------------------ state
               private final RandomSource random = RandomSource.create();
@@ -212,6 +241,9 @@ jobs:
               private int phaseTicks = 0;
               private int lightningTimer = 60;
 
+              // rain / storm / snow cell (used by the radar)
+              private double cellX, cellZ;
+
               // cloud wall
               private boolean wallActive = false;
               private double wallX, wallZ, wallDirX, wallDirZ;
@@ -219,13 +251,46 @@ jobs:
               // tornado
               private boolean tornadoActive = false;
               private double torX, torZ, torDirX, torDirZ;
+              private int torWind = 100;
+              private int torWidth = 120;
+              private int torAge = 0;
+              private boolean torFire = false;
+              private int pendingWind = -1;
+              private int pendingWidth = -1;
+
+              // hurricane
+              private double hurX, hurZ, hurDirX, hurDirZ;
 
               // flood
-              private int floodBaseY, floodY;
+              private double floodCX, floodCZ, floodRadius, floodLevel;
+              private int floodBaseY;
+
+              // hailstones that are falling right now
+              private static final class Hail {
+                  final int id;
+                  final double x;
+                  final double z;
+                  final int y;
+                  int age = 0;
+
+                  Hail(int id, double x, int y, double z) {
+                      this.id = id;
+                      this.x = x;
+                      this.y = y;
+                      this.z = z;
+                  }
+              }
+
+              private final ArrayList<Hail> hailstones = new ArrayList<>();
+              private int hailCounter = 0;
+
+              // radar blocks that are switched on: block position -> game time when they switch off
+              private final HashMap<Long, Long> radars = new HashMap<>();
 
               // everything we changed in the world, so we can put it back
               private final ArrayDeque<Long> floodBlocks = new ArrayDeque<>();
               private final ArrayDeque<Long> snowBlocks = new ArrayDeque<>();
+              private final HashSet<Long> snowSet = new HashSet<>();
               private final ArrayDeque<Long> iceBlocks = new ArrayDeque<>();
 
               private WeatherManager() {
@@ -237,7 +302,21 @@ jobs:
                   if (players.isEmpty()) {
                       return false;
                   }
+                  pendingWind = -1;
+                  pendingWidth = -1;
                   begin(level, players, t);
+                  return true;
+              }
+
+              /** Start a tornado with your own wind speed (mph) and width (blocks). */
+              public boolean forceTornado(ServerLevel level, int wind, int width) {
+                  List<ServerPlayer> players = level.players();
+                  if (players.isEmpty()) {
+                      return false;
+                  }
+                  pendingWind = Mth.clamp(wind, MIN_WIND, MAX_WIND);
+                  pendingWidth = Mth.clamp(width, MIN_WIDTH, MAX_WIDTH);
+                  begin(level, players, Type.TORNADO);
                   return true;
               }
 
@@ -264,16 +343,36 @@ jobs:
                   phaseTicks = 0;
                   wallActive = false;
                   tornadoActive = false;
+                  torFire = false;
+                  pendingWind = -1;
+                  pendingWidth = -1;
+                  hailstones.clear();
+                  radars.clear();
                   floodBlocks.clear();
                   snowBlocks.clear();
+                  snowSet.clear();
                   iceBlocks.clear();
               }
 
-              /** Immediately remove flood water, snow and ice we placed (used when the server stops). */
+              /** Immediately remove flood water, snow, ice and hailstones we placed (used when the server stops). */
               public void restoreAll(ServerLevel level) {
                   drain(floodBlocks, level, Integer.MAX_VALUE, Blocks.WATER, Blocks.AIR.defaultBlockState());
                   drain(snowBlocks, level, Integer.MAX_VALUE, Blocks.SNOW, Blocks.AIR.defaultBlockState());
                   drain(iceBlocks, level, Integer.MAX_VALUE, Blocks.ICE, Blocks.WATER.defaultBlockState());
+                  snowSet.clear();
+                  hailstones.clear();
+                  runCommand(level, "kill @e[type=minecraft:block_display,tag=palhail]");
+              }
+
+              /** Switch a radar block's screen on or off. Returns true when it is now on. */
+              public boolean toggleRadar(ServerLevel level, BlockPos pos) {
+                  long key = pos.asLong();
+                  if (radars.containsKey(key)) {
+                      radars.remove(key);
+                      return false;
+                  }
+                  radars.put(key, level.getGameTime() + RADAR_ON_TICKS);
+                  return true;
               }
 
               // ------------------------------------------------------------------ main tick
@@ -282,16 +381,24 @@ jobs:
                   if (type != Type.FLOOD) {
                       drain(floodBlocks, level, 300, Blocks.WATER, Blocks.AIR.defaultBlockState());
                   }
-                  if (type != Type.SNOWSTORM && type != Type.ICE) {
+                  if (type == Type.THAW) {
+                      meltSnow(level, 30);                                                // the sun melts the snow layer by layer
+                      drain(iceBlocks, level, 8, Blocks.ICE, Blocks.WATER.defaultBlockState());
+                  } else if (type != Type.SNOWSTORM && type != Type.ICE) {
                       drain(snowBlocks, level, 300, Blocks.SNOW, Blocks.AIR.defaultBlockState());
                       drain(iceBlocks, level, 100, Blocks.ICE, Blocks.WATER.defaultBlockState());
                   }
+                  if (snowBlocks.isEmpty()) {
+                      snowSet.clear();
+                  }
 
                   List<ServerPlayer> players = level.players();
+                  long time = level.getGameTime();
+                  tickHailstones(level, players);
                   if (players.isEmpty()) {
                       return;
                   }
-                  long time = level.getGameTime();
+                  tickRadars(level, time);
                   phaseTicks++;
 
                   if (auto) {
@@ -302,25 +409,45 @@ jobs:
                   }
 
                   switch (type) {
-                      case CLEAR, RAIN -> {
+                      case CLEAR -> {
+                          if (climate == Climate.HOT) {
+                              steam(level, players, time);
+                          }
                       }
-                      case STORM -> lightning(level, players, 60, 140);
+                      case RAIN -> {
+                          for (ServerPlayer p : players) {
+                              rain(level, p, time, 12);
+                              cloudDeck(level, p, time, 2);
+                          }
+                      }
+                      case STORM -> {
+                          for (ServerPlayer p : players) {
+                              rain(level, p, time, 25);
+                              cloudDeck(level, p, time, 7);
+                          }
+                          lightning(level, players, 60, 140);
+                      }
                       case CLOUD_WALL -> tickWall(level, players, time, true);
                       case HAIL -> {
                           tickWall(level, players, time, false);
                           tickHail(level, players, time);
+                          for (ServerPlayer p : players) {
+                              cloudDeck(level, p, time, 8);
+                          }
                       }
                       case TORNADO -> {
                           tickTornado(level, players, time);
-                          lightning(level, players, 50, 110);
+                          for (ServerPlayer p : players) {
+                              rain(level, p, time, 15);
+                              cloudDeck(level, p, time, 8);
+                          }
                       }
-                      case HURRICANE -> {
-                          tickHurricane(level, players, time);
-                          lightning(level, players, 40, 90);
-                      }
+                      case HURRICANE -> tickHurricane(level, players, time);
                       case FLOOD -> tickFlood(level, players, time);
                       case SNOWSTORM -> tickSnowstorm(level, players, time);
                       case ICE -> tickIce(level, players, time);
+                      case THAW -> {
+                      }
                   }
               }
 
@@ -340,26 +467,29 @@ jobs:
                               case MILD -> begin(level, players, Type.RAIN);
                               case HOT -> {
                                   int r = random.nextInt(100);
-                                  if (r < 35) {
+                                  if (r < 45) {
                                       begin(level, players, Type.STORM);
-                                  } else if (r < 65) {
+                                  } else if (r < 75) {
                                       begin(level, players, Type.CLOUD_WALL);
-                                  } else if (r < 85) {
-                                      begin(level, players, Type.HURRICANE);
                                   } else {
-                                      begin(level, players, Type.TORNADO);
+                                      begin(level, players, Type.HURRICANE);
                                   }
                               }
                               case COLD -> begin(level, players, Type.SNOWSTORM);
                           }
                       }
                       case RAIN -> begin(level, players, random.nextBoolean() ? Type.FLOOD : Type.CLEAR);
-                      case STORM -> begin(level, players, random.nextBoolean() ? Type.CLOUD_WALL : Type.CLEAR);
+                      case STORM -> {
+                          int r = random.nextInt(10);
+                          begin(level, players, r < 5 ? Type.CLOUD_WALL : (r < 7 ? Type.FLOOD : Type.CLEAR));
+                      }
                       case CLOUD_WALL -> begin(level, players, Type.HAIL);
-                      case HAIL -> begin(level, players, random.nextInt(10) < 6 ? Type.TORNADO : Type.CLEAR);
+                      case HAIL -> begin(level, players, random.nextInt(10) < 7 ? Type.TORNADO : Type.CLEAR);
                       case HURRICANE -> begin(level, players, random.nextInt(10) < 6 ? Type.FLOOD : Type.CLEAR);
+                      case TORNADO -> begin(level, players, random.nextInt(10) < 2 ? Type.FLOOD : Type.CLEAR);
                       case SNOWSTORM -> begin(level, players, Type.ICE);
-                      case FLOOD, TORNADO, ICE -> begin(level, players, Type.CLEAR);
+                      case ICE -> begin(level, players, Type.THAW);
+                      case FLOOD, THAW -> begin(level, players, Type.CLEAR);
                   }
               }
 
@@ -374,11 +504,12 @@ jobs:
                       case STORM -> seconds(90, 150);
                       case FLOOD -> seconds(150, 210);
                       case CLOUD_WALL -> seconds(150, 180);
-                      case HAIL -> seconds(60, 80);
-                      case TORNADO -> seconds(100, 140);
+                      case HAIL -> seconds(70, 90);
+                      case TORNADO -> seconds(120, 160);
                       case HURRICANE -> seconds(180, 240);
                       case SNOWSTORM -> seconds(120, 180);
-                      case ICE -> seconds(100, 150);
+                      case ICE -> seconds(60, 90);
+                      case THAW -> seconds(70, 100);
                   };
               }
 
@@ -391,18 +522,20 @@ jobs:
                   ticksLeft = ticks;
                   phaseTicks = 0;
                   lightningTimer = 40;
+                  pickCell(players);
                   if (t != Type.CLOUD_WALL && t != Type.HAIL) {
                       wallActive = false;
                   }
                   if (t != Type.TORNADO) {
                       tornadoActive = false;
+                      torFire = false;
                   }
 
                   String message;
                   switch (t) {
                       case CLOUD_WALL -> {
                           String from = startWall(players, 110);
-                          message = "A huge dark cloud wall is coming from the " + from + "! Hail follows behind it.";
+                          message = "A huge dark cloud wall is coming from the " + from + "! Hail and maybe a tornado follow behind it.";
                       }
                       case HAIL -> {
                           if (!wallActive) {
@@ -412,17 +545,21 @@ jobs:
                       }
                       case TORNADO -> {
                           String from = startTornado(players);
-                          message = "A TORNADO has formed to the " + from + "! Run or hide!";
+                          message = "A funnel cloud is dropping from the clouds to the " + from + "! A tornado is forming - run or hide!";
                       }
-                      case HURRICANE -> message = "A hurricane is hitting! Strong wind and lightning.";
+                      case HURRICANE -> {
+                          String from = startHurricane(players);
+                          message = "A hurricane is coming from the " + from + "! Strong wind, rain and lightning. The eye is calm.";
+                      }
                       case FLOOD -> {
                           startFlood(players);
-                          message = "Heavy rain is flooding the land! Go to high ground.";
+                          message = "Heavy rain is flooding the land! The water keeps rising - go to high ground.";
                       }
-                      case STORM -> message = "A thunderstorm is rolling in.";
+                      case STORM -> message = "A thunderstorm is rolling in. The air is hot and the clouds grow dark.";
                       case RAIN -> message = "It starts to rain.";
-                      case SNOWSTORM -> message = "A snow storm is coming. It is freezing cold.";
-                      case ICE -> message = "Everything is freezing. Water turns to ice.";
+                      case SNOWSTORM -> message = "A snow storm is coming. The snow piles up.";
+                      case ICE -> message = "The snow stops, but everything is freezing. Water turns to ice.";
+                      case THAW -> message = "The sun comes out and gets hot. Snow and ice are melting.";
                       default -> message = "The sky clears up. Nice weather.";
                   }
 
@@ -430,7 +567,13 @@ jobs:
                   broadcast(players, message);
               }
 
-              /** Uses the normal /weather command so the visuals (rain, thunder, snow in cold biomes) are vanilla. */
+              private void pickCell(List<ServerPlayer> players) {
+                  ServerPlayer p = players.get(random.nextInt(players.size()));
+                  cellX = p.getX() + (random.nextDouble() - 0.5) * 80.0;
+                  cellZ = p.getZ() + (random.nextDouble() - 0.5) * 80.0;
+              }
+
+              /** Uses the normal /weather command so the visuals (rain, thunder) are vanilla. */
               private void applyVanillaWeather(ServerLevel level, Type t, int ticks) {
                   String command = switch (t) {
                       case RAIN, FLOOD, HAIL, SNOWSTORM -> "weather rain " + ticks;
@@ -452,6 +595,49 @@ jobs:
                   }
               }
 
+              // ------------------------------------------------------------------ particles: clouds, rain, steam
+              /** A dark cloud ceiling high above the player. */
+              private void cloudDeck(ServerLevel level, ServerPlayer p, long time, int amount) {
+                  if (time % 2 != 0) {
+                      return;
+                  }
+                  for (int i = 0; i < amount; i++) {
+                      double x = p.getX() + (random.nextDouble() - 0.5) * 64.0;
+                      double z = p.getZ() + (random.nextDouble() - 0.5) * 64.0;
+                      double y = p.getY() + 24.0 + random.nextDouble() * 10.0;
+                      level.sendParticles(ParticleTypes.LARGE_SMOKE, x, y, z, 2, 4.0, 1.0, 4.0, 0.0);
+                  }
+              }
+
+              private void rain(ServerLevel level, ServerPlayer p, long time, int amount) {
+                  if (time % 2 != 0) {
+                      return;
+                  }
+                  level.sendParticles(ParticleTypes.RAIN, p.getX(), p.getY() + 7.0, p.getZ(), amount, 12.0, 3.0, 12.0, 0.0);
+              }
+
+              /** Hot weather: steam rises from the water before the storm. */
+              private void steam(ServerLevel level, List<ServerPlayer> players, long time) {
+                  if (time % 10 != 0) {
+                      return;
+                  }
+                  for (ServerPlayer p : players) {
+                      for (int i = 0; i < 14; i++) {
+                          int x = Mth.floor(p.getX()) + random.nextInt(49) - 24;
+                          int z = Mth.floor(p.getZ()) + random.nextInt(49) - 24;
+                          if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                              continue;
+                          }
+                          int y = level.getHeight(Heightmap.Types.WORLD_SURFACE, x, z) - 1;
+                          BlockState s = level.getBlockState(new BlockPos(x, y, z));
+                          if (s.getFluidState().is(FluidTags.WATER)) {
+                              // count = 0 -> the offsets are the velocity: slowly rising steam
+                              level.sendParticles(ParticleTypes.CLOUD, x + 0.5, y + 1.1, z + 0.5, 0, 0.0, 1.0, 0.0, 0.08);
+                          }
+                      }
+                  }
+              }
+
               // ------------------------------------------------------------------ lightning
               private void lightning(ServerLevel level, List<ServerPlayer> players, int minDelay, int maxDelay) {
                   if (--lightningTimer > 0) {
@@ -461,8 +647,10 @@ jobs:
                   ServerPlayer p = players.get(random.nextInt(players.size()));
                   double angle = random.nextDouble() * Math.PI * 2.0;
                   double dist = 12.0 + random.nextDouble() * 30.0;
-                  int x = Mth.floor(p.getX() + Math.cos(angle) * dist);
-                  int z = Mth.floor(p.getZ() + Math.sin(angle) * dist);
+                  strike(level, Mth.floor(p.getX() + Math.cos(angle) * dist), Mth.floor(p.getZ() + Math.sin(angle) * dist));
+              }
+
+              private void strike(ServerLevel level, int x, int z) {
                   if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
                       return;
                   }
@@ -520,53 +708,207 @@ jobs:
                           begin(level, players, Type.HAIL);
                           return;
                       }
-                      if (time % 2 == 0 && dist < 40.0) {
-                          for (int i = 0; i < 10; i++) {
+                      if (time % 2 == 0 && dist < 44.0) {
+                          // a tall rolling wall: dark at the bottom, light on top
+                          for (int i = 0; i < 16; i++) {
                               double t = (random.nextDouble() * 2.0 - 1.0) * WALL_HALF_WIDTH;
-                              double x = wallX + perpX * t;
-                              double z = wallZ + perpZ * t;
+                              double roll = Math.sin(t * 0.25 + time * 0.1) * 2.0;
+                              double x = wallX + perpX * t + wallDirX * roll;
+                              double z = wallZ + perpZ * t + wallDirZ * roll;
                               if (Math.hypot(x - p.getX(), z - p.getZ()) > 34.0) {
                                   continue;
                               }
-                              double y = p.getY() + 3.0 + random.nextDouble() * 32.0;
-                              level.sendParticles(ParticleTypes.LARGE_SMOKE, x, y, z, 3, 3.0, 3.0, 3.0, 0.0);
+                              double h = random.nextDouble();
+                              double y = p.getY() + 2.0 + h * 36.0;
+                              if (h < 0.7) {
+                                  level.sendParticles(ParticleTypes.LARGE_SMOKE, x, y, z, 3, 3.0, 2.0, 3.0, 0.0);
+                              } else {
+                                  level.sendParticles(ParticleTypes.CLOUD, x, y, z, 2, 3.0, 1.5, 3.0, 0.0);
+                              }
                           }
                       }
                   }
               }
 
+              // ------------------------------------------------------------------ 3D hail
               private void tickHail(ServerLevel level, List<ServerPlayer> players, long time) {
+                  if (time % 2 != 0) {
+                      return;
+                  }
                   for (ServerPlayer p : players) {
                       if (p.isSpectator() || !inHailZone(p.getX(), p.getZ())) {
                           continue;
                       }
-                      if (!level.canSeeSky(p.blockPosition())) {
-                          continue; // under a roof = safe
+                      // hail all around the player
+                      spawnHail(level, p.getX() + (random.nextDouble() - 0.5) * 28.0, p.getZ() + (random.nextDouble() - 0.5) * 28.0);
+                      // sometimes one is aimed straight at the player
+                      if (time % 20 == 0 && random.nextInt(HAIL_AIM_CHANCE) == 0) {
+                          spawnHail(level, p.getX() + (random.nextDouble() - 0.5) * 0.8, p.getZ() + (random.nextDouble() - 0.5) * 0.8);
                       }
-                      if (time % 2 == 0) {
-                          for (int i = 0; i < 8; i++) {
-                              double x = p.getX() + (random.nextDouble() - 0.5) * 20.0;
-                              double z = p.getZ() + (random.nextDouble() - 0.5) * 20.0;
-                              double y = p.getY() + 8.0 + random.nextDouble() * 6.0;
-                              // count = 0 -> the offsets are used as the particle velocity (straight down)
-                              level.sendParticles(ParticleTypes.ITEM_SNOWBALL, x, y, z, 0, 0.0, -1.0, 0.0, 0.9);
-                          }
+                  }
+              }
+
+              /** A hailstone is a small packed-ice block display that falls 14 blocks in 14 ticks. */
+              private void spawnHail(ServerLevel level, double x, double z) {
+                  if (hailstones.size() >= HAIL_MAX_IN_FLIGHT) {
+                      return;
+                  }
+                  int bx = Mth.floor(x);
+                  int bz = Mth.floor(z);
+                  if (!level.hasChunkAt(new BlockPos(bx, 64, bz))) {
+                      return;
+                  }
+                  int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, bx, bz);
+                  int id = ++hailCounter;
+                  hailstones.add(new Hail(id, x, y, z));
+                  String nbt = "{Tags:[\"palhail\",\"palhail" + id + "\"],block_state:{Name:\"minecraft:packed_ice\"},"
+                          + "transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],scale:[0.3f,0.3f,0.3f],translation:[0f,14f,0f]},"
+                          + "interpolation_duration:" + HAIL_FALL_TICKS + "}";
+                  runCommand(level, String.format(Locale.ROOT, "summon minecraft:block_display %.2f %d %.2f ", x, y, z) + nbt);
+              }
+
+              private void tickHailstones(ServerLevel level, List<ServerPlayer> players) {
+                  Iterator<Hail> it = hailstones.iterator();
+                  while (it.hasNext()) {
+                      Hail h = it.next();
+                      h.age++;
+                      if (h.age == 1) {
+                          // start the fall animation
+                          runCommand(level, "data merge entity @e[type=minecraft:block_display,tag=palhail" + h.id + ",limit=1] "
+                                  + "{start_interpolation:0,transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],"
+                                  + "scale:[0.3f,0.3f,0.3f],translation:[0f,0f,0f]}}");
                       }
-                      if (time % 20 == 0 && random.nextInt(HAIL_HIT_CHANCE) == 0) {
+                      if (h.age > HAIL_FALL_TICKS) {
+                          landHail(level, players, h);
+                          it.remove();
+                      }
+                  }
+              }
+
+              private void landHail(ServerLevel level, List<ServerPlayer> players, Hail h) {
+                  runCommand(level, "kill @e[type=minecraft:block_display,tag=palhail" + h.id + "]");
+                  runCommand(level, String.format(Locale.ROOT, "playsound minecraft:block.glass.break ambient @a %.2f %d %.2f 0.7 1.6", h.x, h.y, h.z));
+                  level.sendParticles(ParticleTypes.ITEM_SNOWBALL, h.x, h.y + 0.2, h.z, 6, 0.2, 0.1, 0.2, 0.05);
+                  for (ServerPlayer p : players) {
+                      if (p.isSpectator()) {
+                          continue;
+                      }
+                      // a player under a roof is far below the place where the stone landed, so only open-air players are hit
+                      if (Math.hypot(p.getX() - h.x, p.getZ() - h.z) < 1.3 && Math.abs(p.getY() - h.y) < 2.5) {
                           p.hurtServer(level, level.damageSources().generic(), HAIL_DAMAGE);
-                          p.sendSystemMessage(Component.literal("Ouch! A hailstone hit you!"));
                       }
                   }
               }
 
               // ------------------------------------------------------------------ tornado
+              public static String rating(int wind) {
+                  if (wind < MIN_WIND) {
+                      return "weak";
+                  }
+                  if (wind <= 64) {
+                      return "EFU";
+                  }
+                  if (wind <= 84) {
+                      return "EF0";
+                  }
+                  if (wind <= 101) {
+                      return "EF1";
+                  }
+                  if (wind <= 134) {
+                      return "EF2";
+                  }
+                  if (wind <= 164) {
+                      return "EF3";
+                  }
+                  if (wind <= 199) {
+                      return "EF4";
+                  }
+                  if (wind <= 265) {
+                      return "EF5";
+                  }
+                  return "EF5+";
+              }
+
+              private static float hardnessLimit(int wind) {
+                  if (wind <= 64) {
+                      return 0.2F;     // leaves, plants
+                  }
+                  if (wind <= 84) {
+                      return 0.4F;     // + glass, wool, sand-like things
+                  }
+                  if (wind <= 101) {
+                      return 0.8F;
+                  }
+                  if (wind <= 134) {
+                      return 2.0F;     // wood
+                  }
+                  if (wind <= 164) {
+                      return 3.0F;     // stone, brick
+                  }
+                  if (wind <= 199) {
+                      return 5.0F;     // iron
+                  }
+                  if (wind <= 265) {
+                      return 20.0F;
+                  }
+                  return 50.0F;
+              }
+
+              private String describeTornado() {
+                  return rating(torWind) + " tornado, " + torWind + " mph, width " + torWidth + (torFire ? ", FIRE" : "");
+              }
+
+              private void rollTornado() {
+                  if (pendingWind > 0) {
+                      torWind = pendingWind;
+                      torWidth = pendingWidth;
+                      pendingWind = -1;
+                      pendingWidth = -1;
+                      return;
+                  }
+                  int r = random.nextInt(100);
+                  if (r < 20) {
+                      torWind = 45 + random.nextInt(20);
+                  } else if (r < 45) {
+                      torWind = 65 + random.nextInt(20);
+                  } else if (r < 65) {
+                      torWind = 85 + random.nextInt(17);
+                  } else if (r < 80) {
+                      torWind = 102 + random.nextInt(33);
+                  } else if (r < 90) {
+                      torWind = 135 + random.nextInt(30);
+                  } else if (r < 97) {
+                      torWind = 165 + random.nextInt(35);
+                  } else if (r < 99) {
+                      torWind = 200 + random.nextInt(66);
+                  } else {
+                      torWind = 266 + random.nextInt(MAX_WIND - 266 + 1);
+                  }
+                  int width = 30 + (int) (torWind * 1.2) + random.nextInt(120);
+                  if (random.nextInt(100) < 12) {
+                      width = (int) (width * 2.5);   // a wedge
+                  }
+                  torWidth = Mth.clamp(width, MIN_WIDTH, MAX_WIDTH);
+              }
+
               private String startTornado(List<ServerPlayer> players) {
+                  rollTornado();
                   ServerPlayer target = players.get(random.nextInt(players.size()));
                   double angle = random.nextDouble() * Math.PI * 2.0;
-                  torX = target.getX() + Math.cos(angle) * 60.0;
-                  torZ = target.getZ() + Math.sin(angle) * 60.0;
+                  double dist = 60.0 + Math.min(torWidth / 2.0, 200.0);
+                  if (wallActive) {
+                      // the funnel drops from the cloud wall
+                      torX = wallX + (-wallDirZ) * (random.nextDouble() * 40.0 - 20.0);
+                      torZ = wallZ + wallDirX * (random.nextDouble() * 40.0 - 20.0);
+                      angle = Math.atan2(torZ - target.getZ(), torX - target.getX());
+                  } else {
+                      torX = target.getX() + Math.cos(angle) * dist;
+                      torZ = target.getZ() + Math.sin(angle) * dist;
+                  }
                   torDirX = -Math.cos(angle);
                   torDirZ = -Math.sin(angle);
+                  torAge = 0;
+                  torFire = false;
                   tornadoActive = true;
                   return compass(Math.cos(angle), Math.sin(angle));
               }
@@ -588,6 +930,16 @@ jobs:
                   if (!tornadoActive) {
                       return;
                   }
+                  torAge++;
+                  double progress = Math.min(1.0, torAge / (double) TORNADO_FORM_TICKS);
+                  boolean touching = progress >= 1.0;
+                  double radius = Math.min(500.0, torWidth / 2.0);
+                  double height = 40.0 + torWidth * 0.04;
+
+                  if (torAge == TORNADO_FORM_TICKS) {
+                      broadcast(players, "TOUCHDOWN! " + describeTornado() + ".");
+                  }
+
                   // drift slowly towards the nearest player, with some wobble
                   ServerPlayer nearest = nearestPlayer(players, torX, torZ);
                   double dx = nearest.getX() - torX;
@@ -600,8 +952,9 @@ jobs:
                       torDirX /= dirLen;
                       torDirZ /= dirLen;
                   }
-                  torX += torDirX * TORNADO_SPEED;
-                  torZ += torDirZ * TORNADO_SPEED;
+                  double speed = (TORNADO_SPEED + torWind * 0.0002) * (0.3 + 0.7 * progress);
+                  torX += torDirX * speed;
+                  torZ += torDirZ * speed;
 
                   int bx = Mth.floor(torX);
                   int bz = Mth.floor(torZ);
@@ -610,23 +963,109 @@ jobs:
                   }
                   int groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
 
-                  // funnel made of smoke
-                  if (time % 2 == 0) {
-                      for (int h = 0; h <= 42; h += 3) {
-                          double radius = 1.2 + h * 0.18;
-                          for (int k = 0; k < 4; k++) {
-                              double a = time * 0.35 + h * 0.4 + k * (Math.PI / 2.0);
-                              level.sendParticles(ParticleTypes.LARGE_SMOKE,
-                                      torX + Math.cos(a) * radius, groundY + h, torZ + Math.sin(a) * radius,
-                                      1, 0.2, 0.2, 0.2, 0.0);
-                          }
+                  // the wall cloud follows the tornado
+                  wallX = torX;
+                  wallZ = torZ;
+
+                  drawFunnel(level, players, time, groundY, radius, height, progress);
+                  drawParentCloud(level, players, time, groundY, radius, height);
+
+                  // sometimes lightning hits near the tornado
+                  if (--lightningTimer <= 0) {
+                      lightningTimer = 50 + random.nextInt(60);
+                      if (random.nextBoolean()) {
+                          strike(level, Mth.floor(torX + (random.nextDouble() - 0.5) * 80.0), Mth.floor(torZ + (random.nextDouble() - 0.5) * 80.0));
+                      } else {
+                          ServerPlayer p = players.get(random.nextInt(players.size()));
+                          strike(level, Mth.floor(p.getX() + (random.nextDouble() - 0.5) * 60.0), Mth.floor(p.getZ() + (random.nextDouble() - 0.5) * 60.0));
                       }
-                      level.sendParticles(ParticleTypes.CLOUD, torX, groundY + 44, torZ, 8, 6.0, 1.5, 6.0, 0.0);
                   }
 
-                  // lift and spin everything close to it
-                  AABB box = new AABB(torX - TORNADO_RADIUS, groundY - 4, torZ - TORNADO_RADIUS,
-                          torX + TORNADO_RADIUS, groundY + 50, torZ + TORNADO_RADIUS);
+                  if (!touching) {
+                      return;     // it can only hurt when it touches the ground
+                  }
+                  tornadoEntities(level, time, groundY, radius);
+                  tornadoBreak(level, players, time, radius);
+                  tornadoFire(level, time, groundY, radius);
+              }
+
+              private void drawFunnel(ServerLevel level, List<ServerPlayer> players, long time, int groundY,
+                                      double radius, double height, double progress) {
+                  if (time % 2 != 0) {
+                      return;
+                  }
+                  double bottom = height * (1.0 - progress);     // the funnel lowers from the cloud until it touches the ground
+                  for (ServerPlayer p : players) {
+                      double toPlayer = Math.hypot(p.getX() - torX, p.getZ() - torZ);
+                      if (toPlayer > radius + 60.0) {
+                          continue;
+                      }
+                      int samples = 30 + Math.min(60, torWidth / 20);
+                      double base = Math.atan2(p.getZ() - torZ, p.getX() - torX);
+                      for (int i = 0; i < samples; i++) {
+                          double h = bottom + random.nextDouble() * (height - bottom);
+                          double t = h / height;
+                          double r = radius * (0.18 + 0.82 * Math.pow(t, 1.4));
+                          double spread = Math.PI;
+                          double centerAngle = 0.0;
+                          if (r > 36.0) {
+                              spread = Math.asin(Math.min(1.0, 36.0 / r));
+                              centerAngle = base;
+                          }
+                          double a = centerAngle + (random.nextDouble() * 2.0 - 1.0) * spread;
+                          double x = torX + Math.cos(a) * r;
+                          double z = torZ + Math.sin(a) * r;
+                          if (Math.hypot(x - p.getX(), z - p.getZ()) > 34.0) {
+                              continue;
+                          }
+                          // count = 0 -> offsets are the velocity: the particles spin around the funnel
+                          double vx = -Math.sin(a);
+                          double vz = Math.cos(a);
+                          if (torFire && i % 3 == 0) {
+                              level.sendParticles(ParticleTypes.FLAME, x, groundY + h, z, 0, vx, 0.35, vz, 0.5);
+                          } else if (torFire && i % 7 == 0) {
+                              level.sendParticles(ParticleTypes.LAVA, x, groundY + h, z, 1, 0.3, 0.3, 0.3, 0.0);
+                          } else if (i % 5 == 0) {
+                              level.sendParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, x, groundY + h, z, 0, vx, 0.3, vz, 0.5);
+                          } else {
+                              level.sendParticles(ParticleTypes.LARGE_SMOKE, x, groundY + h, z, 0, vx, 0.3, vz, 0.6);
+                          }
+                          // dust and debris near the ground
+                          if (h < 8.0 && progress >= 1.0) {
+                              level.sendParticles(ParticleTypes.ASH, x, groundY + 0.5 + random.nextDouble() * 4.0, z, 2, 1.5, 1.0, 1.5, 0.1);
+                          }
+                      }
+                  }
+              }
+
+              /** The dark rotating cloud above the tornado. */
+              private void drawParentCloud(ServerLevel level, List<ServerPlayer> players, long time, int groundY,
+                                           double radius, double height) {
+                  if (time % 2 != 0) {
+                      return;
+                  }
+                  double cloudRadius = Math.max(45.0, radius * 1.1);
+                  for (ServerPlayer p : players) {
+                      for (int i = 0; i < 12; i++) {
+                          double x = p.getX() + (random.nextDouble() - 0.5) * 64.0;
+                          double z = p.getZ() + (random.nextDouble() - 0.5) * 64.0;
+                          if (Math.hypot(x - torX, z - torZ) > cloudRadius) {
+                              continue;
+                          }
+                          level.sendParticles(ParticleTypes.LARGE_SMOKE, x, groundY + height + random.nextDouble() * 6.0, z, 3, 3.0, 1.5, 3.0, 0.0);
+                      }
+                  }
+              }
+
+              private void tornadoEntities(ServerLevel level, long time, int groundY, double radius) {
+                  if (time % 4 != 0) {
+                      return;
+                  }
+                  double maxLift = groundY + 8.0 + torWind / 12.0;
+                  AABB box = new AABB(torX - radius, groundY - 4, torZ - radius, torX + radius, maxLift + 20.0, torZ + radius);
+                  double swirl = (0.02 + torWind * 0.0003) * 2.0;     // the push is applied every 4 ticks
+                  int amplifier = Mth.clamp(torWind / 35, 1, 10);
+                  double core = Math.max(3.0, radius * 0.35);
                   for (LivingEntity e : level.getEntitiesOfClass(LivingEntity.class, box)) {
                       if (e.isSpectator()) {
                           continue;
@@ -634,50 +1073,158 @@ jobs:
                       double ex = torX - e.getX();
                       double ez = torZ - e.getZ();
                       double d = Math.max(0.5, Math.hypot(ex, ez));
-                      if (d > TORNADO_RADIUS) {
+                      if (d > radius) {
                           continue;
                       }
                       // swirl around + a little inward pull
-                      e.push((ez / d) * 0.06 + (ex / d) * 0.025, 0.0, (-ex / d) * 0.06 + (ez / d) * 0.025);
-                      if (e.getY() < groundY + TORNADO_MAX_LIFT) {
-                          e.addEffect(new MobEffectInstance(MobEffects.LEVITATION, 25, 3, false, false));
+                      e.push((ez / d) * swirl + (ex / d) * swirl * 0.4, 0.0, (-ex / d) * swirl + (ez / d) * swirl * 0.4);
+                      if (e.getY() < maxLift) {
+                          e.addEffect(new MobEffectInstance(MobEffects.LEVITATION, 14, amplifier, false, false));
+                      }
+                      if (torFire && d < radius * 0.6) {
+                          e.setRemainingFireTicks(100);
+                      }
+                      if (torWind >= 100 && d < core && time % 20 == 0) {
+                          e.hurtServer(level, level.damageSources().generic(), (float) ((torWind - 80) / 25.0));
                       }
                   }
+              }
 
-                  // rip weak blocks (leaves, grass, flowers, glass...) out of the ground
-                  if (TORNADO_BREAKS_BLOCKS && time % 4 == 0) {
-                      for (int i = 0; i < 12; i++) {
-                          double a = random.nextDouble() * Math.PI * 2.0;
-                          double r = random.nextDouble() * 4.0;
-                          BlockPos bp = BlockPos.containing(torX + Math.cos(a) * r, groundY + random.nextInt(6) - 1, torZ + Math.sin(a) * r);
-                          if (!level.hasChunkAt(bp)) {
-                              continue;
+              /** What the tornado can rip out depends on its wind speed. */
+              private void tornadoBreak(ServerLevel level, List<ServerPlayer> players, long time, double radius) {
+                  if (time % 4 != 0) {
+                      return;
+                  }
+                  int count = Math.min(60, 10 + torWidth / 25);
+                  float limit = hardnessLimit(torWind);
+                  for (int i = 0; i < count; i++) {
+                      double cx = torX;
+                      double cz = torZ;
+                      double r = Math.min(radius, 48.0);
+                      if (random.nextBoolean()) {
+                          // half of the damage happens around players who stand inside a big tornado
+                          ServerPlayer p = players.get(random.nextInt(players.size()));
+                          if (Math.hypot(p.getX() - torX, p.getZ() - torZ) <= radius) {
+                              cx = p.getX();
+                              cz = p.getZ();
+                              r = 24.0;
                           }
-                          BlockState s = level.getBlockState(bp);
-                          if (s.isAir() || !s.getFluidState().isEmpty()) {
-                              continue;
+                      }
+                      double a = random.nextDouble() * Math.PI * 2.0;
+                      double dd = Math.sqrt(random.nextDouble()) * r;
+                      int x = Mth.floor(cx + Math.cos(a) * dd);
+                      int z = Mth.floor(cz + Math.sin(a) * dd);
+                      if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                          continue;
+                      }
+                      int gy = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                      BlockPos bp = new BlockPos(x, gy - 4 + random.nextInt(16), z);
+                      BlockState s = level.getBlockState(bp);
+                      if (s.isAir() || !s.getFluidState().isEmpty()) {
+                          continue;
+                      }
+                      float hardness = s.getDestroySpeed(level, bp);
+                      if (hardness < 0.0F || hardness > limit) {
+                          continue;
+                      }
+                      boolean terrain = s.is(BlockTags.MINEABLE_WITH_SHOVEL) || s.is(BlockTags.BASE_STONE_OVERWORLD);
+                      if (terrain && torWind < 200) {
+                          continue;       // only EF5 scours the ground itself
+                      }
+                      level.destroyBlock(bp, false);
+                  }
+              }
+
+              private BlockPos randomAround(double cx, double cz, double r, int y) {
+                  double a = random.nextDouble() * Math.PI * 2.0;
+                  double d = Math.sqrt(random.nextDouble()) * r;
+                  return new BlockPos(Mth.floor(cx + Math.cos(a) * d), y, Mth.floor(cz + Math.sin(a) * d));
+              }
+
+              /** EF1 - EF3 can catch fire when they touch it (EF1/EF2 sometimes, EF3 rarely). EF4 and EF5 never. */
+              private void tornadoFire(ServerLevel level, long time, int groundY, double radius) {
+                  if (time % 10 != 0) {
+                      return;
+                  }
+                  double r = Math.min(radius, 40.0);
+                  if (!torFire) {
+                      if (torWind < 85 || torWind > 164) {
+                          return;
+                      }
+                      for (int i = 0; i < 8; i++) {
+                          BlockPos bp = randomAround(torX, torZ, r, groundY - 1 + random.nextInt(5));
+                          if (level.hasChunkAt(bp) && level.getBlockState(bp).is(BlockTags.FIRE)) {
+                              int chance = torWind <= 134 ? 25 : 8;
+                              if (random.nextInt(100) < chance) {
+                                  torFire = true;
+                                  broadcast(level.players(), "The tornado touched fire! It is a FIRE TORNADO!");
+                              }
+                              return;
                           }
-                          float hardness = s.getDestroySpeed(level, bp);
-                          if (hardness >= 0.0F && hardness <= 0.5F) {
-                              level.destroyBlock(bp, false);
+                      }
+                  } else {
+                      for (int i = 0; i < 6; i++) {
+                          BlockPos bp = randomAround(torX, torZ, r, groundY + random.nextInt(3));
+                          if (level.hasChunkAt(bp) && level.getBlockState(bp).isAir()
+                                  && Blocks.FIRE.defaultBlockState().canSurvive(level, bp)) {
+                              level.setBlockAndUpdate(bp, Blocks.FIRE.defaultBlockState());
                           }
                       }
                   }
               }
 
               // ------------------------------------------------------------------ hurricane
+              private String startHurricane(List<ServerPlayer> players) {
+                  ServerPlayer target = players.get(random.nextInt(players.size()));
+                  double angle = random.nextDouble() * Math.PI * 2.0;
+                  double lateral = (random.nextDouble() - 0.5) * 60.0;
+                  hurX = target.getX() + Math.cos(angle) * 260.0 + (-Math.sin(angle)) * lateral;
+                  hurZ = target.getZ() + Math.sin(angle) * 260.0 + Math.cos(angle) * lateral;
+                  hurDirX = -Math.cos(angle);
+                  hurDirZ = -Math.sin(angle);
+                  return compass(Math.cos(angle), Math.sin(angle));
+              }
+
+              /** 0 in the eye, 1 in the eye wall, then it fades away to 0 at 260 blocks. */
+              private double hurricaneProfile(double d) {
+                  if (d < 28.0) {
+                      return 0.0;
+                  }
+                  if (d < 90.0) {
+                      return 1.0;
+                  }
+                  if (d < 260.0) {
+                      return Math.max(0.1, 1.0 - (d - 90.0) / 170.0);
+                  }
+                  return 0.0;
+              }
+
               private void tickHurricane(ServerLevel level, List<ServerPlayer> players, long time) {
-                  double windAngle = time * 0.0015;
-                  double wx = Math.cos(windAngle);
-                  double wz = Math.sin(windAngle);
+                  hurX += hurDirX * 0.12;
+                  hurZ += hurDirZ * 0.12;
+                  double nearestProfile = 0.0;
                   for (ServerPlayer p : players) {
                       if (p.isSpectator()) {
                           continue;
                       }
-                      if (time % 2 == 0 && level.canSeeSky(p.blockPosition())) {
-                          p.push(wx * 0.05, 0.0, wz * 0.05); // wind pushes you around when you are outside
+                      double rx = p.getX() - hurX;
+                      double rz = p.getZ() - hurZ;
+                      double d = Math.max(1.0, Math.hypot(rx, rz));
+                      double profile = hurricaneProfile(d);
+                      nearestProfile = Math.max(nearestProfile, profile);
+
+                      if (profile > 0.0) {
+                          cloudDeck(level, p, time, 3 + (int) (profile * 8.0));
+                          rain(level, p, time, 10 + (int) (profile * 30.0));
                       }
-                      if (time % 3 == 0) {
+                      if (time % 2 == 0 && profile > 0.0 && level.canSeeSky(p.blockPosition())) {
+                          // the wind goes around the eye and a little inward
+                          double wx = (-rz / d) * 0.9 + (-rx / d) * 0.4;
+                          double wz = (rx / d) * 0.9 + (-rz / d) * 0.4;
+                          double wl = Math.max(0.01, Math.hypot(wx, wz));
+                          p.push(wx / wl * 0.06 * profile, 0.0, wz / wl * 0.06 * profile);
+                      }
+                      if (time % 3 == 0 && profile > 0.0) {
                           for (int arm = 0; arm < 3; arm++) {
                               for (int r = 6; r <= 30; r += 4) {
                                   double a = time * 0.05 + r * 0.14 + arm * (Math.PI * 2.0 / 3.0);
@@ -688,75 +1235,135 @@ jobs:
                           }
                       }
                   }
+                  // more lightning in the eye wall
+                  if (nearestProfile > 0.0) {
+                      lightning(level, players, nearestProfile > 0.6 ? 30 : 70, nearestProfile > 0.6 ? 70 : 140);
+                  }
               }
 
               // ------------------------------------------------------------------ flood
               private void startFlood(List<ServerPlayer> players) {
-                  int lowest = Integer.MAX_VALUE;
-                  for (ServerPlayer p : players) {
-                      lowest = Math.min(lowest, p.blockPosition().getY());
-                  }
-                  floodBaseY = lowest - 1;
-                  floodY = floodBaseY;
+                  ServerPlayer center = players.get(random.nextInt(players.size()));
+                  floodCX = center.getX();
+                  floodCZ = center.getZ();
+                  floodBaseY = center.blockPosition().getY() - 1;
+                  floodLevel = floodBaseY;
+                  floodRadius = 24.0;
               }
 
+              /** The flood belongs to the land, not to the players: it covers a circle that keeps growing. */
               private void tickFlood(ServerLevel level, List<ServerPlayer> players, long time) {
-                  if (phaseTicks % 120 == 0 && floodY < floodBaseY + FLOOD_MAX_RISE) {
-                      floodY++;
+                  floodLevel = Math.min(floodLevel + FLOOD_RISE_PER_TICK, floodBaseY + FLOOD_MAX_RISE);
+                  floodRadius = Math.min(80.0, 24.0 + phaseTicks * 0.02);
+                  for (ServerPlayer p : players) {
+                      rain(level, p, time, 40);
+                      cloudDeck(level, p, time, 5);
                   }
                   if (time % 10 != 0) {
                       return;
                   }
-                  for (ServerPlayer p : players) {
-                      for (int i = 0; i < FLOOD_COLUMNS; i++) {
-                          int x = Mth.floor(p.getX()) + random.nextInt(FLOOD_RADIUS * 2 + 1) - FLOOD_RADIUS;
-                          int z = Mth.floor(p.getZ()) + random.nextInt(FLOOD_RADIUS * 2 + 1) - FLOOD_RADIUS;
-                          if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                  int floodY = Mth.floor(floodLevel);
+                  for (int i = 0; i < FLOOD_COLUMNS; i++) {
+                      double a = random.nextDouble() * Math.PI * 2.0;
+                      double d = Math.sqrt(random.nextDouble()) * floodRadius;
+                      int x = Mth.floor(floodCX + Math.cos(a) * d);
+                      int z = Mth.floor(floodCZ + Math.sin(a) * d);
+                      if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                          continue;
+                      }
+                      int y = level.getHeight(Heightmap.Types.OCEAN_FLOOR, x, z);
+                      BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, y, z);
+                      while (pos.getY() <= floodY) {
+                          BlockState s = level.getBlockState(pos);
+                          if (s.getFluidState().is(FluidTags.WATER)) {
+                              pos.move(Direction.UP); // already wet, look one higher
                               continue;
                           }
-                          int y = level.getHeight(Heightmap.Types.OCEAN_FLOOR, x, z);
-                          BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, y, z);
-                          while (pos.getY() <= floodY) {
-                              BlockState s = level.getBlockState(pos);
-                              if (s.getFluidState().is(FluidTags.WATER)) {
-                                  pos.move(Direction.UP); // already wet, look one higher
-                                  continue;
-                              }
-                              if (s.isAir() || s.canBeReplaced()) {
-                                  level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
-                                  floodBlocks.addLast(pos.asLong());
-                              }
-                              break;
+                          if (s.isAir() || s.canBeReplaced()) {
+                              level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
+                              floodBlocks.addLast(pos.asLong());
                           }
+                          break;
                       }
                   }
               }
 
-              // ------------------------------------------------------------------ snow storm + ice
+              // ------------------------------------------------------------------ snow storm, ice, thaw
               private void tickSnowstorm(ServerLevel level, List<ServerPlayer> players, long time) {
                   for (ServerPlayer p : players) {
                       if (time % 2 == 0) {
-                          level.sendParticles(ParticleTypes.SNOWFLAKE, p.getX(), p.getY() + 7.0, p.getZ(), 30, 12.0, 4.0, 12.0, 0.03);
+                          // snow blown by the wind
+                          level.sendParticles(ParticleTypes.SNOWFLAKE, p.getX(), p.getY() + 7.0, p.getZ(), 60, 14.0, 5.0, 14.0, 0.08);
+                          level.sendParticles(ParticleTypes.WHITE_ASH, p.getX(), p.getY() + 5.0, p.getZ(), 10, 14.0, 4.0, 14.0, 0.05);
                       }
+                      cloudDeck(level, p, time, 3);
                       // freezing like powder snow - leather armor protects
                       if (!p.isSpectator() && level.canSeeSky(p.blockPosition())) {
                           p.setTicksFrozen(Math.min(p.getTicksFrozen() + 3, p.getTicksRequiredToFreeze() + 40));
                       }
                       if (time % 10 == 0) {
-                          for (int i = 0; i < 30; i++) {
+                          for (int i = 0; i < 40; i++) {
                               int x = Mth.floor(p.getX()) + random.nextInt(57) - 28;
                               int z = Mth.floor(p.getZ()) + random.nextInt(57) - 28;
                               if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
                                   continue;
                               }
                               int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
-                              BlockPos pos = new BlockPos(x, y, z);
-                              BlockState snow = Blocks.SNOW.defaultBlockState();
-                              if (level.getBlockState(pos).isAir() && snow.canSurvive(level, pos)) {
-                                  level.setBlockAndUpdate(pos, snow);
-                                  snowBlocks.addLast(pos.asLong());
-                              }
+                              pileSnow(level, new BlockPos(x, y, z));
                           }
+                      }
+                  }
+              }
+
+              /** New snow starts as one layer and the pile grows higher and higher while it snows. */
+              private void pileSnow(ServerLevel level, BlockPos pos) {
+                  BlockState here = level.getBlockState(pos);
+                  BlockPos below = pos.below();
+                  BlockState under = level.getBlockState(below);
+                  if (here.is(Blocks.SNOW) && snowSet.contains(pos.asLong())) {
+                      growSnow(level, pos, here);
+                  } else if (under.is(Blocks.SNOW) && snowSet.contains(below.asLong())) {
+                      growSnow(level, below, under);
+                  } else if (here.isAir()) {
+                      BlockState snow = Blocks.SNOW.defaultBlockState();
+                      if (snow.canSurvive(level, pos)) {
+                          level.setBlockAndUpdate(pos, snow);
+                          snowBlocks.addLast(pos.asLong());
+                          snowSet.add(pos.asLong());
+                      }
+                  }
+              }
+
+              private void growSnow(ServerLevel level, BlockPos pos, BlockState state) {
+                  int layers = state.getValue(BlockStateProperties.LAYERS);
+                  if (layers < SNOW_MAX_LAYERS) {
+                      level.setBlockAndUpdate(pos, state.setValue(BlockStateProperties.LAYERS, layers + 1));
+                  }
+              }
+
+              /** The sun is out: every snow pile loses one layer at a time. */
+              private void meltSnow(ServerLevel level, int perTick) {
+                  int done = 0;
+                  while (done < perTick && !snowBlocks.isEmpty()) {
+                      done++;
+                      long key = snowBlocks.pollLast();
+                      BlockPos pos = BlockPos.of(key);
+                      if (!level.hasChunkAt(pos)) {
+                          snowSet.remove(key);
+                          continue;
+                      }
+                      BlockState s = level.getBlockState(pos);
+                      if (!s.is(Blocks.SNOW)) {
+                          snowSet.remove(key);
+                          continue;
+                      }
+                      int layers = s.getValue(BlockStateProperties.LAYERS);
+                      if (layers > 1) {
+                          level.setBlockAndUpdate(pos, s.setValue(BlockStateProperties.LAYERS, layers - 1));
+                          snowBlocks.addFirst(key);       // melt it a bit more next time
+                      } else {
+                          level.setBlockAndUpdate(pos, Blocks.AIR.defaultBlockState());
+                          snowSet.remove(key);
                       }
                   }
               }
@@ -798,6 +1405,136 @@ jobs:
                   }
               }
 
+              // ------------------------------------------------------------------ radar screen (particles above the radar block)
+              private void tickRadars(ServerLevel level, long time) {
+                  if (radars.isEmpty() || time % 8 != 0) {
+                      return;
+                  }
+                  Iterator<Map.Entry<Long, Long>> it = radars.entrySet().iterator();
+                  while (it.hasNext()) {
+                      Map.Entry<Long, Long> entry = it.next();
+                      BlockPos pos = BlockPos.of(entry.getKey());
+                      if (time > entry.getValue() || !level.hasChunkAt(pos) || !(level.getBlockState(pos).getBlock() instanceof RadarBlock)) {
+                          it.remove();
+                          continue;
+                      }
+                      drawRadar(level, pos);
+                  }
+              }
+
+              private void drawRadar(ServerLevel level, BlockPos pos) {
+                  double cx = pos.getX() + 0.5;
+                  double cz = pos.getZ() + 0.5;
+                  double y = pos.getY() + 2.2;
+                  for (int gz = -RADAR_SIZE; gz <= RADAR_SIZE; gz++) {
+                      for (int gx = -RADAR_SIZE; gx <= RADAR_SIZE; gx++) {
+                          int cls = echo(cx + gx * RADAR_CELL, cz + gz * RADAR_CELL);
+                          if (cls > 0) {
+                              level.sendParticles(RADAR_PARTICLES[cls], cx + gx * RADAR_SPACING, y, cz + gz * RADAR_SPACING, 1, 0.0, 0.0, 0.0, 0.0);
+                          }
+                      }
+                  }
+                  level.sendParticles(ParticleTypes.END_ROD, cx, y + 0.3, cz, 1, 0.0, 0.0, 0.0, 0.0);   // the radar itself
+              }
+
+              private double noise(double x, double z) {
+                  double v = Math.sin(x * 0.03) + Math.sin(z * 0.037 + 1.3) + Math.sin((x + z) * 0.021 + 2.1) + Math.sin((x - z) * 0.047 + 0.4);
+                  return (v + 4.0) / 8.0;
+              }
+
+              private int echoLevel(double v) {
+                  if (v < 0.12) {
+                      return 0;
+                  }
+                  if (v < 0.35) {
+                      return 1;
+                  }
+                  if (v < 0.55) {
+                      return 2;
+                  }
+                  if (v < 0.75) {
+                      return 3;
+                  }
+                  return 4;
+              }
+
+              private int blob(double x, double z, double cx, double cz, double radius) {
+                  double d = Math.hypot(x - cx, z - cz);
+                  return echoLevel(1.0 - d / radius + (noise(x, z) - 0.5) * 0.5);
+              }
+
+              /** What the radar sees at this place: 0 nothing, 1 green ... 4 red, 5 purple, 6 blue, 7 white. */
+              private int echo(double x, double z) {
+                  switch (type) {
+                      case RAIN:
+                          return Math.min(2, blob(x, z, cellX, cellZ, 150.0));
+                      case STORM:
+                          return blob(x, z, cellX, cellZ, 130.0);
+                      case CLOUD_WALL:
+                      case HAIL:
+                          return wallEcho(x, z);
+                      case TORNADO: {
+                          int parent = Math.min(4, blob(x, z, torX, torZ, 120.0));
+                          double core = Math.max(16.0, Math.min(500.0, torWidth / 2.0) * 0.6);
+                          if (tornadoActive && Math.hypot(x - torX, z - torZ) <= core) {
+                              return 5;
+                          }
+                          return parent;
+                      }
+                      case HURRICANE: {
+                          double rx = x - hurX;
+                          double rz = z - hurZ;
+                          double d = Math.hypot(rx, rz);
+                          if (d < 22.0 || d > 240.0) {
+                              return 0;       // the eye is empty
+                          }
+                          double phase = Math.atan2(rz, rx) - d * 0.04;
+                          double arm = 0.5 + 0.5 * Math.sin(phase * 2.0);
+                          double v = (1.0 - d / 240.0) * 0.7 + arm * 0.45 + (d < 60.0 ? 0.35 : 0.0);
+                          return echoLevel(v - 0.1);
+                      }
+                      case FLOOD: {
+                          double d = Math.hypot(x - floodCX, z - floodCZ);
+                          if (d <= floodRadius) {
+                              return 6;
+                          }
+                          return d <= floodRadius + 60.0 ? 1 : 0;
+                      }
+                      case SNOWSTORM:
+                          return noise(x, z) > 0.35 ? 7 : 0;
+                      case ICE:
+                          return blob(x, z, cellX, cellZ, 160.0) > 0 ? 7 : 0;
+                      default:
+                          return 0;
+                  }
+              }
+
+              private int wallEcho(double x, double z) {
+                  if (!wallActive) {
+                      return 0;
+                  }
+                  double dx = x - wallX;
+                  double dz = z - wallZ;
+                  double ahead = dx * wallDirX + dz * wallDirZ + (noise(x, z) - 0.5) * 30.0;
+                  double lateral = Math.abs(dx * -wallDirZ + dz * wallDirX);
+                  if (lateral > WALL_HALF_WIDTH + 40.0 || ahead > 15.0 || ahead < -170.0) {
+                      return 0;
+                  }
+                  if (ahead >= -8.0) {
+                      return type == Type.HAIL ? 5 : 4;      // the front of the wall (hail core is purple)
+                  }
+                  if (ahead >= -15.0) {
+                      return 4;
+                  }
+                  if (ahead >= -60.0) {
+                      return 3;
+                  }
+                  if (ahead >= -110.0) {
+                      return 2;
+                  }
+                  return 1;
+              }
+
               // ------------------------------------------------------------------ radar text
               private static final String[] DIRECTIONS = { "E", "SE", "S", "SW", "W", "NW", "N", "NE" };
 
@@ -821,15 +1558,31 @@ jobs:
                   }
                   if (tornadoActive && type == Type.TORNADO) {
                       long dist = Math.round(Math.hypot(torX - rx, torZ - rz));
-                      out.add("TORNADO: " + dist + " blocks " + compass(torX - rx, torZ - rz) + " - take cover!");
+                      String state = torAge < TORNADO_FORM_TICKS ? "funnel forming" : describeTornado();
+                      out.add("TORNADO: " + dist + " blocks " + compass(torX - rx, torZ - rz) + " - " + state);
                   }
-                  switch (type) {
-                      case HURRICANE -> out.add("Hurricane: strong wind and lightning, stay inside.");
-                      case FLOOD -> out.add("Flood: water is rising, go to high ground.");
-                      case SNOWSTORM, ICE -> out.add("Cold: water freezes. Leather armor protects against freezing.");
-                      default -> {
-                      }
+                  if (type == Type.HURRICANE) {
+                      long dist = Math.round(Math.hypot(hurX - rx, hurZ - rz));
+                      out.add("Hurricane eye: " + dist + " blocks " + compass(hurX - rx, hurZ - rz) + " - stay inside.");
                   }
+                  if (type == Type.FLOOD) {
+                      long dist = Math.round(Math.hypot(floodCX - rx, floodCZ - rz));
+                      out.add("Flood: center " + dist + " blocks " + compass(floodCX - rx, floodCZ - rz)
+                              + ", radius " + Math.round(floodRadius) + ", water level +" + Math.round((floodLevel - floodBaseY) * 10.0) / 10.0);
+                  }
+                  if (type == Type.SNOWSTORM || type == Type.ICE) {
+                      out.add("Cold: snow piles up and water freezes. Leather armor protects against freezing.");
+                  }
+                  if (type == Type.THAW) {
+                      out.add("The sun is out. Snow and ice are melting.");
+                  }
+                  return out;
+              }
+
+              public List<String> radarLegend() {
+                  List<String> out = new ArrayList<>();
+                  out.add("Radar colors: green = light rain, yellow = rain, orange = heavy rain, red = storm / hail,");
+                  out.add("purple = tornado or hail core, blue = flood, white = snow / ice. The empty hole in a hurricane is the eye.");
                   return out;
               }
           }
@@ -844,6 +1597,7 @@ jobs:
 
           import com.mojang.brigadier.CommandDispatcher;
           import com.mojang.brigadier.arguments.BoolArgumentType;
+          import com.mojang.brigadier.arguments.IntegerArgumentType;
           import com.mojang.brigadier.arguments.StringArgumentType;
 
           import net.minecraft.commands.CommandSourceStack;
@@ -854,6 +1608,7 @@ jobs:
 
           /**
            * /wx set <type>          - start a weather type now (clear, rain, storm, flood, cloud_wall, hail, tornado, hurricane, snowstorm, ice)
+           * /wx tornado <windspeed 45-400> <width 20-1000>  - your own tornado (EFU 45-64, EF0 65-84, EF1 85-101, EF2 102-134, EF3 135-164, EF4 165-199, EF5 200-265)
            * /wx climate <mode>      - mild | hot | cold | auto
            * /wx auto <true|false>   - false = the current weather never ends by itself
            * /wx status              - show what is happening
@@ -878,6 +1633,12 @@ jobs:
                           .then(Commands.literal("auto")
                                   .then(Commands.argument("on", BoolArgumentType.bool())
                                           .executes(ctx -> setAuto(ctx.getSource(), BoolArgumentType.getBool(ctx, "on")))))
+                          .then(Commands.literal("tornado")
+                                  .then(Commands.argument("windspeed", IntegerArgumentType.integer(WeatherManager.MIN_WIND, WeatherManager.MAX_WIND))
+                                          .then(Commands.argument("width", IntegerArgumentType.integer(WeatherManager.MIN_WIDTH, WeatherManager.MAX_WIDTH))
+                                                  .executes(ctx -> setTornado(ctx.getSource(),
+                                                          IntegerArgumentType.getInteger(ctx, "windspeed"),
+                                                          IntegerArgumentType.getInteger(ctx, "width"))))))
                           .then(Commands.literal("status")
                                   .executes(ctx -> status(ctx.getSource()))));
               }
@@ -902,6 +1663,16 @@ jobs:
                       return 0;
                   }
                   source.sendSuccess(() -> Component.literal("Weather: " + type.label), true);
+                  return 1;
+              }
+
+              private static int setTornado(CommandSourceStack source, int wind, int width) {
+                  ServerLevel overworld = source.getServer().overworld();
+                  if (!WeatherManager.INSTANCE.forceTornado(overworld, wind, width)) {
+                      source.sendFailure(Component.literal("Nobody is online in the overworld."));
+                      return 0;
+                  }
+                  source.sendSuccess(() -> Component.literal("Tornado: " + WeatherManager.rating(wind) + ", " + wind + " mph, width " + width), true);
                   return 1;
               }
 
@@ -959,9 +1730,18 @@ jobs:
 
               @Override
               protected InteractionResult useWithoutItem(BlockState state, Level level, BlockPos pos, Player player, BlockHitResult hit) {
-                  if (level instanceof ServerLevel && player instanceof ServerPlayer serverPlayer) {
+                  if (level instanceof ServerLevel serverLevel && player instanceof ServerPlayer serverPlayer) {
+                      boolean on = WeatherManager.INSTANCE.toggleRadar(serverLevel, pos);
+                      serverPlayer.sendSystemMessage(Component.literal(on
+                              ? "Radar screen ON for 2 minutes. Look at the dots above the block. Right-click again to switch it off."
+                              : "Radar screen OFF."));
                       for (String line : WeatherManager.INSTANCE.radarReport(pos.getX() + 0.5, pos.getZ() + 0.5)) {
                           serverPlayer.sendSystemMessage(Component.literal(line));
+                      }
+                      if (on) {
+                          for (String line : WeatherManager.INSTANCE.radarLegend()) {
+                              serverPlayer.sendSystemMessage(Component.literal(line));
+                          }
                       }
                   }
                   return InteractionResult.SUCCESS;
@@ -1030,14 +1810,15 @@ jobs:
 
           [[mods]]
           modId = "palweathers"
-          version = "1.0.0"
+          version = "1.3.4"
           displayName = "Palweathers"
           iconFile = "logo.png"
           authors = "Palweathers"
           description = '''
           Real weather for Minecraft: rain, floods, thunderstorms, a cloud wall with hail,
-          tornadoes, hurricanes, snow storms and freezing ice. Craft a Weather Radar block to see what is coming.
-          Commands: /wx set <weather>, /wx climate <hot|cold|mild|auto>, /wx status
+          EF-scale tornadoes, fire tornadoes, 3D hail, hurricanes with an eye, floods, snow that piles up and melts.
+          Craft a Weather Radar block and right-click it to see a radar picture in the air.
+          Commands: /wx set <weather>, /wx tornado <windspeed> <width>, /wx climate <hot|cold|mild|auto>, /wx status
           '''
 
           [[dependencies.palweathers]]
@@ -1056,498 +1837,599 @@ jobs:
           PALWEATHERS_EOF
           mkdir -p src/main/resources
           base64 -d > src/main/resources/logo.png <<'PALWEATHERS_EOF'
-          iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAMAAABrrFhUAAAAwFBMVEWsqcuFhqV4epJvdIpna4Vf
-          Y3pWXXJRV2pOUWFHT11KSE9DSFQ+Rlc8Rj87QVA3QTlKOCw/NzU4Pkg4OD4zO0gyPDIyNkUyNDYt
-          ODwsOSotMz0oMjUrOSIoNSAnMyAkMh07LSQwKiUpLzcpKCYkLi8jLxojKjYjJykeKjgfJzMfKSQd
-          JDIdJCggLBgeKhccJhcZJBUlHxceHx8ZICoZHx0VHSkWGyIWIBIUHBMdGRIWGR4TGSASGBcXFhMQ
-          FRoTExFJd7B8AABscElEQVR42pW9CUPiTNM1zKWyb2NYwhoEAoxhFVAQt///r746p6qToM79vF9m
-          XECF1OmqU0tXd2du/rPrRq7bfK3ZbLbb7V6vN5nM5Xp8XPK/XvNHeWbOH8zxcM4P/TKfT3q9Nv64
-          3WzWanih1KWv2Y6vHq5a095GXmu5Wq2Wy+VBrufnF1xvb4fnN16Ht8+3T7vk4een/k+eekk9wrVM
-          Pz58fj5f/VReFU/qlbmNpScAFXezk4neWiy8AwCSzhWCee9xrgDw2YnIL38t/7xaLHYsMGWWb9oO
-          XweAAr3ktVoBAJX/xQC4CAB6mbifn98Efnn7BsDhfwIgv/62jAG4+y+NQK5SiwFomwo88uYUAL16
-          Tuh2SnpVAIot/3t6TXrXFwDoqXoBAAUagOI9Hg0AQ+D55fDiNOAtJSLGz1TgzUn0+T8AeP58u9KI
-          z7eX5xQA2dv/kusmWxQEbIjappy8likFEADmOvTtuYOFslIBaAWq2aopk94EAE0w6KoKOui9Sa09
-          mThNe4T8pgG4Xp4fBQBFwHB4u1wAhAGQWMHbZ/oRrsdrAJ7b7vGLPvP8kgIge0saUC64zRcqXlMB
-          6KUBMAXQu+3FJpACgOPLsde/dJqSXACAOvENgN6kOVGUBQSqgOjA82GuXJAC4POiFCAAKCu8JEC8
-          vfwLgM8UAGoLQDcGIJe7u6EJmArki7VmSgOuEXjsNXu8dZOwbVwo3/WMAXvz2HAee/Mr9KgM1ART
-          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
-          Bff1TOqDm53uRy2mYcqPdQA84JTyoyoCobSbBFOIOER1OtFhn2hrIZmhYXlCuVgqqUP/+mV4vxLf
-          GK/guPqVj6vAWDD4/wBN9bsIoPOK6wAAAABJRU5ErkJggg==
+          iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAMAAABrrFhUAAAWfmNhQlgAABZ+anVtYgAAAB5qdW1k
+          YzJwYQARABCAAACqADibcQNjMnBhAAAAFlhqdW1iAAAAR2p1bWRjMm1hABEAEIAAAKoAOJtxA3Vy
+          bjpjMnBhOmQ3NzJhZTUyLTNiNGEtNDE5Ni05NWE4LWRjNzg2MmU2ZWFkNAAAAAOTanVtYgAAAClq
+          dW1kYzJhcwARABCAAACqADibcQNjMnBhLmFzc2VydGlvbnMAAAAAuGp1bWIAAABEanVtZGNib3IA
+          EQAQgAAAqgA4m3ETYzJwYS5pbmdyZWRpZW50LnYzAAAAABhjMnNoJKmbp3BTM+lVKOS1TJzQdgAA
+          AGxjYm9yo2lkYzpmb3JtYXRpaW1hZ2UvcG5namluc3RhbmNlSUR4LHhtcDppaWQ6ZjZkNDgxZjkt
+          ZTMzMi00NzA2LTk1OGItZjZlOWRiN2FjZWY3bHJlbGF0aW9uc2hpcGhwYXJlbnRPZgAAAeJqdW1i
+          AAAAQWp1bWRjYm9yABEAEIAAAKoAOJtxE2MycGEuYWN0aW9ucy52MgAAAAAYYzJzaNQpKYwFMR7I
+          VS2qnlpVa54AAAGZY2JvcqJnYWN0aW9uc4KiZmFjdGlvbmtjMnBhLm9wZW5lZGpwYXJhbWV0ZXJz
+          oWtpbmdyZWRpZW50c4GiY3VybHgtc2VsZiNqdW1iZj1jMnBhLmFzc2VydGlvbnMvYzJwYS5pbmdy
+          ZWRpZW50LnYzZGhhc2hYIBUSoqQSUKwjwzqaleVzRe3e1zc8qjYClOWTx//JPrj+pGZhY3Rpb254
+          HWNvbS5hbnRocm9waWMuY2xhdWRlLnByb3ZpZGVkanBhcmFtZXRlcnOheB9jb20uYW50aHJvcGlj
+          Lm9yaWdpbi1jb25maWRlbmNlZ3Vua25vd25rZGVzY3JpcHRpb254ZkNsYXVkZSBwcm92aWRlZCB0
+          aGlzIGZpbGUgYXQgdGhlIHJlcXVlc3Qgb2YgYSB1c2VyIGFuZCBtYXkgaGF2ZSBjcmVhdGVkIG9y
+          IG1vZGlmaWVkIHRoZSBmaWxlIGNvbnRlbnRzLm1zb2Z0d2FyZUFnZW50oWRuYW1lZkNsYXVkZXJh
+          bGxBY3Rpb25zSW5jbHVkZWT1AAAAyGp1bWIAAABAanVtZGNib3IAEQAQgAAAqgA4m3ETYzJwYS5o
+          YXNoLmRhdGEAAAAAGGMyc2gm/TZ7qFDAmzQaopMZsy1qAAAAgGNib3KlY2FsZ2ZzaGEyNTZjcGFk
+          TQAAAAAAAAAAAAAAAABkaGFzaFgglGlOMv3GGAoecztdzzGRhy2ucvefbwiqCBQNTJDVUnVkbmFt
+          ZW5qdW1iZiBtYW5pZmVzdGpleGNsdXNpb25zgaJlc3RhcnQYIWZsZW5ndGgZFooAAAI+anVtYgAA
+          ACdqdW1kYzJjbAARABCAAACqADibcQNjMnBhLmNsYWltLnYyAAAAAg9jYm9ypWNhbGdmc2hhMjU2
+          aXNpZ25hdHVyZXhNc2VsZiNqdW1iZj0vYzJwYS91cm46YzJwYTpkNzcyYWU1Mi0zYjRhLTQxOTYt
+          OTVhOC1kYzc4NjJlNmVhZDQvYzJwYS5zaWduYXR1cmVqaW5zdGFuY2VJRHgseG1wOmlpZDphMmRj
+          MjAxZS02NDI0LTQ1NmItYThlMS1iMWQ1YTgzMTVlMjJyY3JlYXRlZF9hc3NlcnRpb25zg6JjdXJs
+          eC1zZWxmI2p1bWJmPWMycGEuYXNzZXJ0aW9ucy9jMnBhLmluZ3JlZGllbnQudjNkaGFzaFggFRKi
+          pBJQrCPDOpqV5XNF7d7XNzyqNgKU5ZPH/8k+uP6iY3VybHgqc2VsZiNqdW1iZj1jMnBhLmFzc2Vy
+          dGlvbnMvYzJwYS5hY3Rpb25zLnYyZGhhc2hYICRk9az/F3F1PG+wGRHd6i8VZJWFSX2QcvIaesdf
+          GCcYomN1cmx4KXNlbGYjanVtYmY9YzJwYS5hc3NlcnRpb25zL2MycGEuaGFzaC5kYXRhZGhhc2hY
+          ILzIFWlJLhP9NoU930gLv23FDU16WaIWVOjdfhXJfVzHdGNsYWltX2dlbmVyYXRvcl9pbmZvo2Ru
+          YW1lb0FudGhyb3BpYyBGaWxlc2d2ZXJzaW9uZTEuMC4wa3NwZWNWZXJzaW9uZTIuNC4wAAAQOGp1
+          bWIAAAAoanVtZGMyY3MAEQAQgAAAqgA4m3EDYzJwYS5zaWduYXR1cmUAAAAQCGNib3LShFkCEqIB
+          JhghWQIKMIICBjCCAY2gAwIBAgIUQOWgCu7COdC+uIP6BkIFPWdVEwAwCgYIKoZIzj0EAwMwSTEX
+          MBUGA1UEChMOQW50aHJvcGljLCBQQkMxLjAsBgNVBAMTJUFudGhyb3BpYyBDb250ZW50IENyZWRl
+          bnRpYWxzIFJvb3QgQ0EwHhcNMjYwODA3MTg0MzU2WhcNMjgwODA2MTk0MzU2WjBEMRcwFQYDVQQK
+          Ew5BbnRocm9waWMsIFBCQzEpMCcGA1UEAxMgQW50aHJvcGljIENsYXVkZSBDb250ZW50IFNpZ25p
+          bmcwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASYegpry1AYBRTVNL1CpTlbROnY3dey+UrsF9C3
+          phYrATN3ZHf93Mo8RQN0KOUuOn19P4oWNFWe5n2/She9N7eTo1gwVjAOBgNVHQ8BAf8EBAMCB4Aw
+          FQYDVR0lBA4wDAYKKwYBBAGD6F4CATAMBgNVHRMBAf8EAjAAMB8GA1UdIwQYMBaAFM5R4gSBTmRb
+          I/jjxM+aPpzB11zCMAoGCCqGSM49BAMDA2cAMGQCMDFzHRSeAXrSy1WOzkbhPZ6Km2wGTmZ/2gK1
+          8k8BQGXyqz88Rdrz6CTX9flAnYNVxgIwcF9c3fVhqmJKpi+UhasNUMko69cyX6STPfta3Q8EjyzD
+          jzoyrol46FP6VFHhvUcJoWNwYWRZDZ4AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+          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
           PALWEATHERS_EOF
           find . -type f | sort
 
@@ -1568,7 +2450,7 @@ jobs:
           cd mdk
           sed -i -E 's/^mod_id *=.*/mod_id=palweathers/' gradle.properties
           sed -i -E 's/^mod_name *=.*/mod_name=Palweathers/' gradle.properties
-          sed -i -E 's/^mod_version *=.*/mod_version=1.0.0/' gradle.properties
+          sed -i -E 's/^mod_version *=.*/mod_version=1.3.4/' gradle.properties
           sed -i -E 's/^mod_group_id *=.*/mod_group_id=com.palweathers/' gradle.properties
           sed -i -E 's/^mod_authors *=.*/mod_authors=Palweathers/' gradle.properties
           sed -i -E 's/^minecraft_version *=.*/minecraft_version=26.3/' gradle.properties
