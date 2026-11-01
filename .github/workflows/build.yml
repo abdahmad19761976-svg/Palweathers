@@ -34,6 +34,7 @@ jobs:
           import net.neoforged.neoforge.common.NeoForge;
           import net.neoforged.neoforge.event.BuildCreativeModeTabContentsEvent;
           import net.neoforged.neoforge.event.RegisterCommandsEvent;
+          import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
           import net.neoforged.neoforge.event.server.ServerStartingEvent;
           import net.neoforged.neoforge.event.server.ServerStoppingEvent;
           import net.neoforged.neoforge.event.tick.ServerTickEvent;
@@ -69,6 +70,7 @@ jobs:
                   NeoForge.EVENT_BUS.addListener(this::onRegisterCommands);
                   NeoForge.EVENT_BUS.addListener(this::onServerStarting);
                   NeoForge.EVENT_BUS.addListener(this::onServerStopping);
+                  NeoForge.EVENT_BUS.addListener(this::onEntityJoin);
               }
 
               private void addCreative(BuildCreativeModeTabContentsEvent event) {
@@ -89,6 +91,13 @@ jobs:
                   } catch (RuntimeException e) {
                       weatherFailed = true;
                       LOGGER.error("WeatherMod crashed and has been switched off until restart", e);
+                  }
+              }
+
+              /** Cloud cubes and hailstones from an old session (for example after a crash) are removed when they load. */
+              private void onEntityJoin(EntityJoinLevelEvent event) {
+                  if (event.getLevel() instanceof ServerLevel && CloudField.INSTANCE.isStale(event.getEntity().getTags())) {
+                      event.setCanceled(true);
                   }
               }
 
@@ -209,9 +218,9 @@ jobs:
               public static final int MAX_WIND = 400;                 // mph
               public static final int MIN_WIDTH = 20;
               public static final int MAX_WIDTH = 1000;               // blocks
-              private static final int FLOOD_COLUMNS = 120;           // columns filled every 10 ticks
+              private static final int FLOOD_COLUMNS = 200;           // columns filled every 10 ticks
               private static final double FLOOD_RISE_PER_TICK = 0.1 / 20.0; // water rises 0.1 block every second
-              private static final int FLOOD_MAX_RISE = 10;
+              private static final int FLOOD_MAX_RISE = 14;
               private static final int SNOW_MAX_LAYERS = 6;
               private static final int RADAR_SIZE = 10;               // radar cells on each side of the block
               private static final double RADAR_CELL = 16.0;          // blocks in the world per radar cell
@@ -335,6 +344,7 @@ jobs:
               }
 
               public void reset() {
+                  CloudField.INSTANCE.reset();
                   type = Type.CLEAR;
                   climate = Climate.MILD;
                   climateLocked = false;
@@ -362,6 +372,7 @@ jobs:
                   snowSet.clear();
                   hailstones.clear();
                   runCommand(level, "kill @e[type=minecraft:block_display,tag=palhail]");
+                  CloudField.INSTANCE.killAll(level);
               }
 
               /** Switch a radar block's screen on or off. Returns true when it is now on. */
@@ -395,6 +406,7 @@ jobs:
                   List<ServerPlayer> players = level.players();
                   long time = level.getGameTime();
                   tickHailstones(level, players);
+                  CloudField.INSTANCE.tick(level, players, cloudMood(), time);
                   if (players.isEmpty()) {
                       return;
                   }
@@ -502,7 +514,7 @@ jobs:
                       case CLEAR -> seconds(120, 240);
                       case RAIN -> seconds(80, 140);
                       case STORM -> seconds(90, 150);
-                      case FLOOD -> seconds(150, 210);
+                      case FLOOD -> seconds(240, 300);
                       case CLOUD_WALL -> seconds(150, 180);
                       case HAIL -> seconds(70, 90);
                       case TORNADO -> seconds(120, 160);
@@ -510,6 +522,15 @@ jobs:
                       case SNOWSTORM -> seconds(120, 180);
                       case ICE -> seconds(60, 90);
                       case THAW -> seconds(70, 100);
+                  };
+              }
+
+              /** 0 = white clouds, 1 = grey clouds, 2 = dark storm clouds. */
+              private int cloudMood() {
+                  return switch (type) {
+                      case CLEAR, THAW, ICE -> 0;
+                      case RAIN, SNOWSTORM -> 1;
+                      default -> 2;
                   };
               }
 
@@ -761,7 +782,7 @@ jobs:
                   int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, bx, bz);
                   int id = ++hailCounter;
                   hailstones.add(new Hail(id, x, y, z));
-                  String nbt = "{Tags:[\"palhail\",\"palhail" + id + "\"],block_state:{Name:\"minecraft:packed_ice\"},"
+                  String nbt = "{Tags:[\"palhail\",\"palhail" + id + "\",\"palsess" + CloudField.INSTANCE.session() + "\"],block_state:{Name:\"minecraft:packed_ice\"},"
                           + "transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],scale:[0.3f,0.3f,0.3f],translation:[0f,14f,0f]},"
                           + "interpolation_duration:" + HAIL_FALL_TICKS + "}";
                   runCommand(level, String.format(Locale.ROOT, "summon minecraft:block_display %.2f %d %.2f ", x, y, z) + nbt);
@@ -1000,7 +1021,7 @@ jobs:
                       if (toPlayer > radius + 60.0) {
                           continue;
                       }
-                      int samples = 30 + Math.min(60, torWidth / 20);
+                      int samples = 60 + Math.min(120, torWidth / 10);
                       double base = Math.atan2(p.getZ() - torZ, p.getX() - torX);
                       for (int i = 0; i < samples; i++) {
                           double h = bottom + random.nextDouble() * (height - bottom);
@@ -1085,7 +1106,7 @@ jobs:
                           e.setRemainingFireTicks(100);
                       }
                       if (torWind >= 100 && d < core && time % 20 == 0) {
-                          e.hurtServer(level, level.damageSources().generic(), (float) ((torWind - 80) / 25.0));
+                          e.hurtServer(level, level.damageSources().generic(), (float) ((torWind - 80) / 15.0));
                       }
                   }
               }
@@ -1095,7 +1116,7 @@ jobs:
                   if (time % 4 != 0) {
                       return;
                   }
-                  int count = Math.min(60, 10 + torWidth / 25);
+                  int count = Math.min(120, 20 + torWidth / 12);
                   float limit = hardnessLimit(torWind);
                   for (int i = 0; i < count; i++) {
                       double cx = torX;
@@ -1254,7 +1275,7 @@ jobs:
               /** The flood belongs to the land, not to the players: it covers a circle that keeps growing. */
               private void tickFlood(ServerLevel level, List<ServerPlayer> players, long time) {
                   floodLevel = Math.min(floodLevel + FLOOD_RISE_PER_TICK, floodBaseY + FLOOD_MAX_RISE);
-                  floodRadius = Math.min(80.0, 24.0 + phaseTicks * 0.02);
+                  floodRadius = Math.min(150.0, 24.0 + phaseTicks * 0.04);
                   for (ServerPlayer p : players) {
                       rain(level, p, time, 40);
                       cloudDeck(level, p, time, 5);
@@ -1284,6 +1305,45 @@ jobs:
                               floodBlocks.addLast(pos.asLong());
                           }
                           break;
+                      }
+                  }
+                  washAway(level, floodY);
+              }
+
+              /** The flood tears weak blocks (plants, torches, crops, glass ...) out of the ground when the water touches them. */
+              private void washAway(ServerLevel level, int floodY) {
+                  for (int i = 0; i < 60; i++) {
+                      double a = random.nextDouble() * Math.PI * 2.0;
+                      double d = Math.sqrt(random.nextDouble()) * floodRadius;
+                      int x = Mth.floor(floodCX + Math.cos(a) * d);
+                      int z = Mth.floor(floodCZ + Math.sin(a) * d);
+                      if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                          continue;
+                      }
+                      int low = floodBaseY - 2;
+                      int top = Math.min(floodY, level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z) + 2);
+                      int y = low + random.nextInt(Math.max(1, top - low + 1));
+                      BlockPos bp = new BlockPos(x, y, z);
+                      BlockState s = level.getBlockState(bp);
+                      if (s.isAir() || !s.getFluidState().isEmpty()) {
+                          continue;
+                      }
+                      float hardness = s.getDestroySpeed(level, bp);
+                      if (hardness < 0.0F || hardness > 0.6F) {
+                          continue;
+                      }
+                      if (s.is(BlockTags.LEAVES) || s.is(BlockTags.MINEABLE_WITH_SHOVEL) || s.is(BlockTags.BASE_STONE_OVERWORLD)) {
+                          continue;
+                      }
+                      boolean wet = false;
+                      for (Direction dir : Direction.values()) {
+                          if (level.getFluidState(bp.relative(dir)).is(FluidTags.WATER)) {
+                              wet = true;
+                              break;
+                          }
+                      }
+                      if (wet) {
+                          level.destroyBlock(bp, false);
                       }
                   }
               }
@@ -1588,6 +1648,265 @@ jobs:
           }
           PALWEATHERS_EOF
           mkdir -p src/main/java/com/palweathers
+          cat > src/main/java/com/palweathers/CloudField.java <<'PALWEATHERS_EOF'
+          package com.palweathers;
+
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Iterator;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Set;
+
+          import net.minecraft.commands.CommandSourceStack;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.util.Mth;
+          import net.minecraft.util.RandomSource;
+
+          /**
+           * "PRO clouds": real 3D clouds built from many block-display cubes (up to MESH_MAX cubes at once).
+           * They replace the flat Minecraft clouds. Turn the normal clouds off in
+           * Options > Video Settings > Clouds = Off, then only these clouds are left.
+           *
+           * Mood: 0 = white fair-weather clouds, 1 = grey clouds, 2 = dark storm clouds.
+           */
+          public final class CloudField {
+              public static final CloudField INSTANCE = new CloudField();
+
+              public static final int MESH_MAX = 1000;       // most cloud cubes alive at the same time
+              private static final int COMMANDS_PER_TICK = 12;
+
+              private static final class Cell {
+                  final int id;
+                  final int puffs;
+                  final int mood;
+                  final int life;      // ticks
+                  double x;
+                  double z;
+                  int age = 0;
+
+                  Cell(int id, int puffs, int mood, int life, double x, double z) {
+                      this.id = id;
+                      this.puffs = puffs;
+                      this.mood = mood;
+                      this.life = life;
+                      this.x = x;
+                      this.z = z;
+                  }
+              }
+
+              private final RandomSource random = RandomSource.create();
+              private final ArrayDeque<String> commands = new ArrayDeque<>();
+              private final ArrayList<Cell> cells = new ArrayList<>();
+              private int counter = 0;
+              private int puffTotal = 0;
+              private boolean enabled = true;
+              private String session = Long.toString(System.nanoTime() % 1000000L);
+              private double windX = 0.03;      // blocks per tick
+              private double windZ = 0.012;
+
+              private CloudField() {
+              }
+
+              public String session() {
+                  return session;
+              }
+
+              public boolean isEnabled() {
+                  return enabled;
+              }
+
+              /** New session: cloud cubes saved by an older session (after a crash) are thrown away when they load. */
+              public void reset() {
+                  session = Long.toString(System.nanoTime() % 1000000L);
+                  commands.clear();
+                  cells.clear();
+                  puffTotal = 0;
+              }
+
+              public boolean isStale(Set<String> tags) {
+                  boolean ours = tags.contains("palcloud") || tags.contains("palhail");
+                  return ours && !tags.contains("palsess" + session);
+              }
+
+              public void setEnabled(ServerLevel level, boolean on) {
+                  enabled = on;
+                  if (!on) {
+                      killAll(level);
+                  }
+              }
+
+              public void killAll(ServerLevel level) {
+                  commands.clear();
+                  cells.clear();
+                  puffTotal = 0;
+                  run(level, "kill @e[type=minecraft:block_display,tag=palcloud]");
+              }
+
+              public int cubeCount() {
+                  return puffTotal;
+              }
+
+              public int cloudCount() {
+                  return cells.size();
+              }
+
+              private void run(ServerLevel level, String command) {
+                  MinecraftServer server = level.getServer();
+                  server.getCommands().performPrefixedCommand(server.createCommandSourceStack().withSuppressedOutput(), command);
+              }
+
+              private void flush(ServerLevel level) {
+                  if (commands.isEmpty()) {
+                      return;
+                  }
+                  MinecraftServer server = level.getServer();
+                  CommandSourceStack source = server.createCommandSourceStack().withSuppressedOutput();
+                  for (int i = 0; i < COMMANDS_PER_TICK && !commands.isEmpty(); i++) {
+                      server.getCommands().performPrefixedCommand(source, commands.pollFirst());
+                  }
+              }
+
+              public void tick(ServerLevel level, List<ServerPlayer> players, int mood, long time) {
+                  flush(level);
+                  if (!enabled || players.isEmpty()) {
+                      return;
+                  }
+
+                  // the wind slowly changes direction
+                  if (time % 200 == 0) {
+                      double a = Math.atan2(windZ, windX) + (random.nextDouble() - 0.5) * 0.6;
+                      double speed = 0.02 + random.nextDouble() * 0.02;
+                      windX = Math.cos(a) * speed;
+                      windZ = Math.sin(a) * speed;
+                  }
+
+                  // the clouds drift (the cubes glide smoothly because of teleport_duration)
+                  if (time % 40 == 0) {
+                      double dx = windX * 40.0;
+                      double dz = windZ * 40.0;
+                      for (Cell c : cells) {
+                          c.x += dx;
+                          c.z += dz;
+                          commands.add(String.format(Locale.ROOT, "tp @e[type=minecraft:block_display,tag=palcloud%d] ~%.3f ~ ~%.3f", c.id, dx, dz));
+                      }
+                  }
+
+                  // old clouds go away, clouds of the wrong mood fade out one by one, far clouds are removed
+                  if (time % 20 == 0) {
+                      Iterator<Cell> it = cells.iterator();
+                      while (it.hasNext()) {
+                          Cell c = it.next();
+                          c.age += 20;
+                          boolean far = true;
+                          for (ServerPlayer p : players) {
+                              if (Math.hypot(p.getX() - c.x, p.getZ() - c.z) < 190.0) {
+                                  far = false;
+                                  break;
+                              }
+                          }
+                          boolean wrongMood = c.mood != mood && random.nextInt(8) == 0;
+                          if (c.age >= c.life || far || wrongMood) {
+                              commands.add("kill @e[type=minecraft:block_display,tag=palcloud" + c.id + "]");
+                              puffTotal -= c.puffs;
+                              it.remove();
+                          }
+                      }
+                  }
+
+                  // new clouds
+                  if (time % 10 == 0 && commands.size() < 150) {
+                      int wanted = mood == 2 ? 18 : (mood == 1 ? 14 : 12);
+                      if (cells.size() < wanted) {
+                          spawnCell(players, mood);
+                      }
+                  }
+              }
+
+              private String blockFor(int mood) {
+                  int r = random.nextInt(10);
+                  if (mood == 0) {
+                      return r < 8 ? "minecraft:white_concrete" : "minecraft:light_gray_concrete";
+                  }
+                  if (mood == 1) {
+                      return r < 7 ? "minecraft:light_gray_concrete" : "minecraft:gray_concrete";
+                  }
+                  return r < 6 ? "minecraft:gray_concrete" : (r < 8 ? "minecraft:black_concrete" : "minecraft:light_gray_concrete");
+              }
+
+              private static String f(double v) {
+                  return String.format(Locale.ROOT, "%.3f", v) + "f";
+              }
+
+              private void spawnCell(List<ServerPlayer> players, int mood) {
+                  ServerPlayer p = players.get(random.nextInt(players.size()));
+                  double a = random.nextDouble() * Math.PI * 2.0;
+                  double dist = mood == 2 ? random.nextDouble() * 140.0 : 40.0 + random.nextDouble() * 110.0;
+                  double cx = p.getX() + Math.cos(a) * dist;
+                  double cz = p.getZ() + Math.sin(a) * dist;
+                  double cy = Math.min(290.0, p.getY() + (mood == 2 ? 36.0 : 46.0) + random.nextDouble() * 18.0);
+                  double radius = mood == 2 ? 38.0 + random.nextDouble() * 26.0 : 16.0 + random.nextDouble() * 22.0;
+                  int puffs = Mth.clamp((int) (radius * 0.9), 10, 60);
+                  if (puffTotal + puffs > MESH_MAX) {
+                      return;
+                  }
+                  int id = ++counter;
+                  int life = (120 + random.nextInt(120)) * 20;
+                  cells.add(new Cell(id, puffs, mood, life, cx, cz));
+                  puffTotal += puffs;
+
+                  String brightness = mood == 2 ? "{sky:8,block:0}" : (mood == 1 ? "{sky:12,block:0}" : "{sky:15,block:15}");
+                  for (int k = 0; k < puffs; k++) {
+                      double ang = random.nextDouble() * Math.PI * 2.0;
+                      double r = Math.sqrt(random.nextDouble()) * radius;
+                      double edge = r / radius;
+                      double height = (1.0 - edge * edge) * radius * 0.28 * random.nextDouble();
+                      double size = (6.0 + random.nextDouble() * 7.0) * (1.0 - 0.45 * edge);
+                      double sx = size;
+                      double sy = size * (mood == 2 ? 0.55 : 0.8);
+                      double sz = size;
+
+                      // random rotation (quaternion) so the cubes do not look like a grid
+                      double ax = random.nextDouble() - 0.5;
+                      double ay = random.nextDouble() - 0.5;
+                      double az = random.nextDouble() - 0.5;
+                      double al = Math.max(1.0E-6, Math.sqrt(ax * ax + ay * ay + az * az));
+                      ax /= al;
+                      ay /= al;
+                      az /= al;
+                      double theta = random.nextDouble() * Math.PI;
+                      double s = Math.sin(theta / 2.0);
+                      double qx = ax * s;
+                      double qy = ay * s;
+                      double qz = az * s;
+                      double qw = Math.cos(theta / 2.0);
+
+                      // translation = -(rotation applied to half of the scaled cube), so the cube turns around its middle
+                      double vx = sx / 2.0;
+                      double vy = sy / 2.0;
+                      double vz = sz / 2.0;
+                      double tx = 2.0 * (qy * vz - qz * vy);
+                      double ty = 2.0 * (qz * vx - qx * vz);
+                      double tz = 2.0 * (qx * vy - qy * vx);
+                      double rx = vx + qw * tx + (qy * tz - qz * ty);
+                      double ry = vy + qw * ty + (qz * tx - qx * tz);
+                      double rz = vz + qw * tz + (qx * ty - qy * tx);
+
+                      String nbt = "{Tags:[\"palcloud\",\"palcloud" + id + "\",\"palsess" + session + "\"],"
+                              + "block_state:{Name:\"" + blockFor(mood) + "\"},"
+                              + "transformation:{left_rotation:[" + f(qx) + "," + f(qy) + "," + f(qz) + "," + f(qw) + "],"
+                              + "right_rotation:[0f,0f,0f,1f],scale:[" + f(sx) + "," + f(sy) + "," + f(sz) + "],"
+                              + "translation:[" + f(-rx) + "," + f(-ry) + "," + f(-rz) + "]},"
+                              + "brightness:" + brightness + ",view_range:3f,teleport_duration:40}";
+                      commands.add(String.format(Locale.ROOT, "summon minecraft:block_display %.2f %.2f %.2f ",
+                              cx + Math.cos(ang) * r, cy + height, cz + Math.sin(ang) * r) + nbt);
+                  }
+              }
+          }
+          PALWEATHERS_EOF
+          mkdir -p src/main/java/com/palweathers
           cat > src/main/java/com/palweathers/WeatherCommands.java <<'PALWEATHERS_EOF'
           package com.palweathers;
 
@@ -1609,6 +1928,7 @@ jobs:
           /**
            * /wx set <type>          - start a weather type now (clear, rain, storm, flood, cloud_wall, hail, tornado, hurricane, snowstorm, ice)
            * /wx tornado <windspeed 45-400> <width 20-1000>  - your own tornado (EFU 45-64, EF0 65-84, EF1 85-101, EF2 102-134, EF3 135-164, EF4 165-199, EF5 200-265)
+           * /wx clouds <true|false> - PRO clouds on/off (turn them off if the game lags)
            * /wx climate <mode>      - mild | hot | cold | auto
            * /wx auto <true|false>   - false = the current weather never ends by itself
            * /wx status              - show what is happening
@@ -1639,6 +1959,9 @@ jobs:
                                                   .executes(ctx -> setTornado(ctx.getSource(),
                                                           IntegerArgumentType.getInteger(ctx, "windspeed"),
                                                           IntegerArgumentType.getInteger(ctx, "width"))))))
+                          .then(Commands.literal("clouds")
+                                  .then(Commands.argument("on", BoolArgumentType.bool())
+                                          .executes(ctx -> setClouds(ctx.getSource(), BoolArgumentType.getBool(ctx, "on")))))
                           .then(Commands.literal("status")
                                   .executes(ctx -> status(ctx.getSource()))));
               }
@@ -1673,6 +1996,12 @@ jobs:
                       return 0;
                   }
                   source.sendSuccess(() -> Component.literal("Tornado: " + WeatherManager.rating(wind) + ", " + wind + " mph, width " + width), true);
+                  return 1;
+              }
+
+              private static int setClouds(CommandSourceStack source, boolean on) {
+                  CloudField.INSTANCE.setEnabled(source.getServer().overworld(), on);
+                  source.sendSuccess(() -> Component.literal(on ? "PRO clouds ON (max " + CloudField.MESH_MAX + " cubes)." : "PRO clouds OFF."), true);
                   return 1;
               }
 
@@ -1810,13 +2139,13 @@ jobs:
 
           [[mods]]
           modId = "palweathers"
-          version = "1.3.4"
+          version = "1.8.4"
           displayName = "Palweathers"
           iconFile = "logo.png"
           authors = "Palweathers"
           description = '''
           Real weather for Minecraft: rain, floods, thunderstorms, a cloud wall with hail,
-          EF-scale tornadoes, fire tornadoes, 3D hail, hurricanes with an eye, floods, snow that piles up and melts.
+          PRO 3D clouds, EF-scale tornadoes, fire tornadoes, 3D hail, hurricanes with an eye, floods, snow that piles up and melts.
           Craft a Weather Radar block and right-click it to see a radar picture in the air.
           Commands: /wx set <weather>, /wx tornado <windspeed> <width>, /wx climate <hot|cold|mild|auto>, /wx status
           '''
@@ -2450,7 +2779,7 @@ jobs:
           cd mdk
           sed -i -E 's/^mod_id *=.*/mod_id=palweathers/' gradle.properties
           sed -i -E 's/^mod_name *=.*/mod_name=Palweathers/' gradle.properties
-          sed -i -E 's/^mod_version *=.*/mod_version=1.3.4/' gradle.properties
+          sed -i -E 's/^mod_version *=.*/mod_version=1.8.4/' gradle.properties
           sed -i -E 's/^mod_group_id *=.*/mod_group_id=com.palweathers/' gradle.properties
           sed -i -E 's/^mod_authors *=.*/mod_authors=Palweathers/' gradle.properties
           sed -i -E 's/^minecraft_version *=.*/minecraft_version=26.3/' gradle.properties
