@@ -34,7 +34,6 @@ jobs:
           import net.neoforged.neoforge.common.NeoForge;
           import net.neoforged.neoforge.event.BuildCreativeModeTabContentsEvent;
           import net.neoforged.neoforge.event.RegisterCommandsEvent;
-          import net.neoforged.neoforge.event.entity.EntityJoinLevelEvent;
           import net.neoforged.neoforge.event.server.ServerStartingEvent;
           import net.neoforged.neoforge.event.server.ServerStoppingEvent;
           import net.neoforged.neoforge.event.tick.ServerTickEvent;
@@ -70,7 +69,6 @@ jobs:
                   NeoForge.EVENT_BUS.addListener(this::onRegisterCommands);
                   NeoForge.EVENT_BUS.addListener(this::onServerStarting);
                   NeoForge.EVENT_BUS.addListener(this::onServerStopping);
-                  NeoForge.EVENT_BUS.addListener(this::onEntityJoin);
               }
 
               private void addCreative(BuildCreativeModeTabContentsEvent event) {
@@ -91,13 +89,6 @@ jobs:
                   } catch (RuntimeException e) {
                       weatherFailed = true;
                       LOGGER.error("WeatherMod crashed and has been switched off until restart", e);
-                  }
-              }
-
-              /** Cloud cubes and hailstones from an old session (for example after a crash) are removed when they load. */
-              private void onEntityJoin(EntityJoinLevelEvent event) {
-                  if (event.getLevel() instanceof ServerLevel && CloudField.INSTANCE.isStale(event.getEntity().getTags())) {
-                      event.setCanceled(true);
                   }
               }
 
@@ -1656,7 +1647,6 @@ jobs:
           import java.util.Iterator;
           import java.util.List;
           import java.util.Locale;
-          import java.util.Set;
 
           import net.minecraft.commands.CommandSourceStack;
           import net.minecraft.server.MinecraftServer;
@@ -1726,11 +1716,6 @@ jobs:
                   puffTotal = 0;
               }
 
-              public boolean isStale(Set<String> tags) {
-                  boolean ours = tags.contains("palcloud") || tags.contains("palhail");
-                  return ours && !tags.contains("palsess" + session);
-              }
-
               public void setEnabled(ServerLevel level, boolean on) {
                   enabled = on;
                   if (!on) {
@@ -1771,6 +1756,11 @@ jobs:
 
               public void tick(ServerLevel level, List<ServerPlayer> players, int mood, long time) {
                   flush(level);
+                  // cubes saved by an older session (for example after a crash) are removed as soon as their chunk is loaded
+                  if (time % 100 == 0) {
+                      run(level, "kill @e[type=minecraft:block_display,tag=palcloud,tag=!palsess" + session + "]");
+                      run(level, "kill @e[type=minecraft:block_display,tag=palhail,tag=!palsess" + session + "]");
+                  }
                   if (!enabled || players.isEmpty()) {
                       return;
                   }
