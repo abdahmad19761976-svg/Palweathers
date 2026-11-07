@@ -1287,7 +1287,9 @@ jobs:
                       cloudDeck(level, p, time, 5);
                       if (time % 20 == 0 && Math.hypot(p.getX() - floodCX, p.getZ() - floodCZ) <= floodRadius + 50.0) {
                           double feet = (floodLevel - floodBaseY) * 3.28;
-                          p.displayClientMessage(Component.literal(String.format(Locale.ROOT, "FLOOD GAUGE: %.1f ft and rising", feet)), true);
+                          // /title ... actionbar shows text at the bottom of the screen, like a real flood gauge sign
+                          runCommand(level, String.format(Locale.ROOT, "title %s actionbar {\"text\":\"FLOOD GAUGE: %.1f ft and rising\",\"color\":\"yellow\"}",
+                                  p.getScoreboardName(), feet));
                       }
                   }
                   if (time % 10 != 0) {
