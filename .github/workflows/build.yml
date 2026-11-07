@@ -204,7 +204,7 @@ jobs:
               private static final double WALL_HAIL_DISTANCE = 22.0;  // hail starts when the wall is this close
               private static final double HAIL_DEPTH = 250.0;         // hail zone behind the wall
               private static final double TORNADO_SPEED = 0.22;       // blocks per tick (players sprint faster)
-              private static final int TORNADO_FORM_TICKS = 200;      // the funnel needs 10 seconds to touch the ground
+              private static final int TORNADO_FORM_TICKS = 300;      // the funnel needs 15 seconds to touch the ground
               public static final int MIN_WIND = 45;
               public static final int MAX_WIND = 400;                 // mph
               public static final int MIN_WIDTH = 20;
@@ -436,6 +436,7 @@ jobs:
                           tickHail(level, players, time);
                           for (ServerPlayer p : players) {
                               cloudDeck(level, p, time, 8);
+                              hailSky(level, p, time);
                           }
                       }
                       case TORNADO -> {
@@ -506,7 +507,7 @@ jobs:
                       case RAIN -> seconds(80, 140);
                       case STORM -> seconds(90, 150);
                       case FLOOD -> seconds(240, 300);
-                      case CLOUD_WALL -> seconds(150, 180);
+                      case CLOUD_WALL -> seconds(200, 260);
                       case HAIL -> seconds(70, 90);
                       case TORNADO -> seconds(120, 160);
                       case HURRICANE -> seconds(180, 240);
@@ -626,6 +627,17 @@ jobs:
                       return;
                   }
                   level.sendParticles(ParticleTypes.RAIN, p.getX(), p.getY() + 7.0, p.getZ(), amount, 12.0, 3.0, 12.0, 0.0);
+              }
+
+              /** Hail falling across the whole sky, white with a green tint - it never looks like plain dark rain. */
+              private void hailSky(ServerLevel level, ServerPlayer p, long time) {
+                  if (time % 2 != 0) {
+                      return;
+                  }
+                  level.sendParticles(ParticleTypes.ITEM_SNOWBALL, p.getX(), p.getY() + 9.0, p.getZ(), 20, 16.0, 4.0, 16.0, 0.08);
+                  if (time % 6 == 0) {
+                      level.sendParticles(ParticleTypes.HAPPY_VILLAGER, p.getX(), p.getY() + 9.0, p.getZ(), 6, 16.0, 4.0, 16.0, 0.0);
+                  }
               }
 
               /** Hot weather: steam rises from the water before the storm. */
@@ -858,12 +870,12 @@ jobs:
                       return 3.0F;     // stone, brick
                   }
                   if (wind <= 199) {
-                      return 5.0F;     // iron
+                      return 8.0F;      // iron, most house walls
                   }
                   if (wind <= 265) {
-                      return 20.0F;
+                      return 35.0F;     // whole houses, roads
                   }
-                  return 50.0F;
+                  return 90.0F;         // almost anything
               }
 
               private String describeTornado() {
@@ -1007,6 +1019,8 @@ jobs:
                       return;
                   }
                   double bottom = height * (1.0 - progress);     // the funnel lowers from the cloud until it touches the ground
+                  // weak (EFU-EF2) tornadoes look brown/dusty (like a "rope"), strong ones look dark and grey
+                  int brownChance = Mth.clamp(90 - (torWind - MIN_WIND), 5, 90);
                   for (ServerPlayer p : players) {
                       double toPlayer = Math.hypot(p.getX() - torX, p.getZ() - torZ);
                       if (toPlayer > radius + 60.0) {
@@ -1033,11 +1047,12 @@ jobs:
                           // count = 0 -> offsets are the velocity: the particles spin around the funnel
                           double vx = -Math.sin(a);
                           double vz = Math.cos(a);
+                          boolean brown = random.nextInt(100) < brownChance;
                           if (torFire && i % 3 == 0) {
                               level.sendParticles(ParticleTypes.FLAME, x, groundY + h, z, 0, vx, 0.35, vz, 0.5);
                           } else if (torFire && i % 7 == 0) {
                               level.sendParticles(ParticleTypes.LAVA, x, groundY + h, z, 1, 0.3, 0.3, 0.3, 0.0);
-                          } else if (i % 5 == 0) {
+                          } else if (brown) {
                               level.sendParticles(ParticleTypes.CAMPFIRE_COSY_SMOKE, x, groundY + h, z, 0, vx, 0.3, vz, 0.5);
                           } else {
                               level.sendParticles(ParticleTypes.LARGE_SMOKE, x, groundY + h, z, 0, vx, 0.3, vz, 0.6);
@@ -1107,7 +1122,7 @@ jobs:
                   if (time % 4 != 0) {
                       return;
                   }
-                  int count = Math.min(120, 20 + torWidth / 12);
+                  int count = Math.min(160, 20 + torWidth / 12 + (torWind >= 165 ? 40 : 0));
                   float limit = hardnessLimit(torWind);
                   for (int i = 0; i < count; i++) {
                       double cx = torX;
@@ -1140,8 +1155,8 @@ jobs:
                           continue;
                       }
                       boolean terrain = s.is(BlockTags.MINEABLE_WITH_SHOVEL) || s.is(BlockTags.BASE_STONE_OVERWORLD);
-                      if (terrain && torWind < 200) {
-                          continue;       // only EF5 scours the ground itself
+                      if (terrain && torWind < 165) {
+                          continue;       // only EF4+ scours the ground, roads and foundations themselves
                       }
                       level.destroyBlock(bp, false);
                   }
@@ -1270,6 +1285,10 @@ jobs:
                   for (ServerPlayer p : players) {
                       rain(level, p, time, 40);
                       cloudDeck(level, p, time, 5);
+                      if (time % 20 == 0 && Math.hypot(p.getX() - floodCX, p.getZ() - floodCZ) <= floodRadius + 50.0) {
+                          double feet = (floodLevel - floodBaseY) * 3.28;
+                          p.displayClientMessage(Component.literal(String.format(Locale.ROOT, "FLOOD GAUGE: %.1f ft and rising", feet)), true);
+                      }
                   }
                   if (time % 10 != 0) {
                       return;
@@ -2129,7 +2148,7 @@ jobs:
 
           [[mods]]
           modId = "palweathers"
-          version = "1.8.4"
+          version = "2.2.3"
           displayName = "Palweathers"
           iconFile = "logo.png"
           authors = "Palweathers"
@@ -2769,7 +2788,7 @@ jobs:
           cd mdk
           sed -i -E 's/^mod_id *=.*/mod_id=palweathers/' gradle.properties
           sed -i -E 's/^mod_name *=.*/mod_name=Palweathers/' gradle.properties
-          sed -i -E 's/^mod_version *=.*/mod_version=1.8.4/' gradle.properties
+          sed -i -E 's/^mod_version *=.*/mod_version=2.2.3/' gradle.properties
           sed -i -E 's/^mod_group_id *=.*/mod_group_id=com.palweathers/' gradle.properties
           sed -i -E 's/^mod_authors *=.*/mod_authors=Palweathers/' gradle.properties
           sed -i -E 's/^minecraft_version *=.*/minecraft_version=26.3/' gradle.properties
