@@ -1068,6 +1068,7 @@ jobs:
                   tornadoEntities(level, time, groundY, radius);
                   tornadoBreak(level, players, time, radius);
                   tornadoRip(level, time, radius);
+                  tornadoScar(level, time, radius);
                   tornadoFire(level, time, groundY, radius);
               }
 
@@ -1218,6 +1219,29 @@ jobs:
                       }
                       level.destroyBlock(bp, false);
                       spawnDebris(level, bp, s, radius);
+                  }
+              }
+
+              /** A real tornado leaves a brown scar on the ground: the grass under it is torn into dirt (EF0 and stronger). */
+              private void tornadoScar(ServerLevel level, long time, double radius) {
+                  if (time % 4 != 0 || torWind < 65) {
+                      return;
+                  }
+                  double r = Math.min(radius * 0.7, 30.0);
+                  int count = 6 + Math.min(24, torWidth / 30);
+                  for (int i = 0; i < count; i++) {
+                      double a = random.nextDouble() * Math.PI * 2.0;
+                      double d = Math.sqrt(random.nextDouble()) * r;
+                      int x = Mth.floor(torX + Math.cos(a) * d);
+                      int z = Mth.floor(torZ + Math.sin(a) * d);
+                      if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                          continue;
+                      }
+                      int gy = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                      BlockPos bp = new BlockPos(x, gy - 1, z);
+                      if (level.getBlockState(bp).is(Blocks.GRASS_BLOCK)) {
+                          level.setBlockAndUpdate(bp, Blocks.COARSE_DIRT.defaultBlockState());
+                      }
                   }
               }
 
@@ -1602,14 +1626,20 @@ jobs:
                           p.setTicksFrozen(Math.min(p.getTicksFrozen() + 3, p.getTicksRequiredToFreeze() + 40));
                       }
                       if (time % 10 == 0) {
-                          for (int i = 0; i < 40; i++) {
+                          for (int i = 0; i < 25; i++) {
                               int x = Mth.floor(p.getX()) + random.nextInt(57) - 28;
                               int z = Mth.floor(p.getZ()) + random.nextInt(57) - 28;
-                              if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
-                                  continue;
+                              for (int dx = -1; dx <= 1; dx++) {
+                                  for (int dz = -1; dz <= 1; dz++) {
+                                      int nx = x + dx;
+                                      int nz = z + dz;
+                                      if (!level.hasChunkAt(new BlockPos(nx, 64, nz))) {
+                                          continue;
+                                      }
+                                      int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, nx, nz);
+                                      pileSnow(level, new BlockPos(nx, y, nz));
+                                  }
                               }
-                              int y = level.getHeight(Heightmap.Types.MOTION_BLOCKING, x, z);
-                              pileSnow(level, new BlockPos(x, y, z));
                           }
                       }
                   }
@@ -1718,21 +1748,43 @@ jobs:
                           it.remove();
                           continue;
                       }
-                      drawRadar(level, pos);
+                      drawRadar(level, pos, time);
                   }
               }
 
-              private void drawRadar(ServerLevel level, BlockPos pos) {
+              private void drawRadar(ServerLevel level, BlockPos pos, long time) {
                   double cx = pos.getX() + 0.5;
                   double cz = pos.getZ() + 0.5;
                   double y = pos.getY() + 2.2;
                   for (int gz = -RADAR_SIZE; gz <= RADAR_SIZE; gz++) {
                       for (int gx = -RADAR_SIZE; gx <= RADAR_SIZE; gx++) {
+                          if (gx * gx + gz * gz > RADAR_SIZE * RADAR_SIZE) {
+                              continue;       // the scope is round
+                          }
                           int cls = echo(cx + gx * RADAR_CELL, cz + gz * RADAR_CELL);
                           if (cls > 0) {
                               level.sendParticles(RADAR_PARTICLES[cls], cx + gx * RADAR_SPACING, y, cz + gz * RADAR_SPACING, 1, 0.0, 0.0, 0.0, 0.0);
                           }
                       }
+                  }
+                  double edge = RADAR_SIZE * RADAR_SPACING;
+                  // outer ring and an inner ring
+                  for (int i = 0; i < 32; i++) {
+                      double a = i * Math.PI * 2.0 / 32.0;
+                      level.sendParticles(ParticleTypes.END_ROD, cx + Math.cos(a) * edge, y, cz + Math.sin(a) * edge, 1, 0.0, 0.0, 0.0, 0.0);
+                  }
+                  for (int i = 0; i < 16; i++) {
+                      double a = i * Math.PI * 2.0 / 16.0;
+                      level.sendParticles(ParticleTypes.END_ROD, cx + Math.cos(a) * edge * 0.5, y, cz + Math.sin(a) * edge * 0.5, 1, 0.0, 0.0, 0.0, 0.0);
+                  }
+                  // north marker (north is the -z side)
+                  for (int k = 1; k <= 3; k++) {
+                      level.sendParticles(ParticleTypes.END_ROD, cx, y + k * 0.25, cz - edge - 0.3, 1, 0.0, 0.0, 0.0, 0.0);
+                  }
+                  // the sweep line goes around once every 6 seconds
+                  double sweep = (time % 120L) / 120.0 * Math.PI * 2.0;
+                  for (double r = 0.5; r <= edge; r += 0.45) {
+                      level.sendParticles(ParticleTypes.ELECTRIC_SPARK, cx + Math.cos(sweep) * r, y + 0.05, cz + Math.sin(sweep) * r, 1, 0.0, 0.0, 0.0, 0.0);
                   }
                   level.sendParticles(ParticleTypes.END_ROD, cx, y + 0.3, cz, 1, 0.0, 0.0, 0.0, 0.0);   // the radar itself
               }
@@ -1850,6 +1902,11 @@ jobs:
                   out.add("=== Weather Radar ===");
                   out.add("Weather: " + type.label + (auto ? " (" + Math.max(0, ticksLeft / 20) + "s left)" : " (locked)"));
                   out.add("Climate: " + climate.name().toLowerCase(Locale.ROOT) + (climateLocked ? " (locked)" : ""));
+                  if (type == Type.RAIN || type == Type.STORM || type == Type.SNOWSTORM || type == Type.ICE) {
+                      long dist = Math.round(Math.hypot(cellX - rx, cellZ - rz));
+                      out.add("Nearest " + (type == Type.STORM ? "storm" : (type == Type.RAIN ? "rain" : "snow")) + ": " + dist
+                              + " blocks " + compass(cellX - rx, cellZ - rz));
+                  }
                   if (wallActive && (type == Type.CLOUD_WALL || type == Type.HAIL)) {
                       double[] c = nearestWallPoint(rx, rz);
                       long dist = Math.round(Math.hypot(c[0] - rx, c[1] - rz));
@@ -2452,7 +2509,7 @@ jobs:
 
           [[mods]]
           modId = "palweathers"
-          version = "2.7.8"
+          version = "3.7.5"
           displayName = "Palweathers"
           iconFile = "logo.png"
           authors = "Palweathers"
@@ -3092,7 +3149,7 @@ jobs:
           cd mdk
           sed -i -E 's/^mod_id *=.*/mod_id=palweathers/' gradle.properties
           sed -i -E 's/^mod_name *=.*/mod_name=Palweathers/' gradle.properties
-          sed -i -E 's/^mod_version *=.*/mod_version=2.7.8/' gradle.properties
+          sed -i -E 's/^mod_version *=.*/mod_version=3.7.5/' gradle.properties
           sed -i -E 's/^mod_group_id *=.*/mod_group_id=com.palweathers/' gradle.properties
           sed -i -E 's/^mod_authors *=.*/mod_authors=Palweathers/' gradle.properties
           sed -i -E 's/^minecraft_version *=.*/minecraft_version=26.3/' gradle.properties
