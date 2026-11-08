@@ -126,6 +126,7 @@ jobs:
           import net.minecraft.core.BlockPos;
           import net.minecraft.core.Direction;
           import net.minecraft.core.particles.ParticleTypes;
+          import net.minecraft.core.registries.BuiltInRegistries;
           import net.minecraft.core.particles.SimpleParticleType;
           import net.minecraft.network.chat.Component;
           import net.minecraft.server.MinecraftServer;
@@ -212,6 +213,10 @@ jobs:
               private static final int FLOOD_COLUMNS = 200;           // columns filled every 10 ticks
               private static final double FLOOD_RISE_PER_TICK = 0.1 / 20.0; // water rises 0.1 block every second
               private static final int FLOOD_MAX_RISE = 14;
+              private static final int FLOOD_MAX_COLUMNS = 9000;     // the flood can cover this many columns
+              private static final double FLOOD_MAX_RADIUS = 110.0;
+              private static final int DEBRIS_MAX = 150;             // blocks flying around in a tornado at the same time
+              private static final int DEBRIS_FLY_TICKS = 40;
               private static final int SNOW_MAX_LAYERS = 6;
               private static final int RADAR_SIZE = 10;               // radar cells on each side of the block
               private static final double RADAR_CELL = 16.0;          // blocks in the world per radar cell
@@ -262,8 +267,38 @@ jobs:
               private double hurX, hurZ, hurDirX, hurDirZ;
 
               // flood
-              private double floodCX, floodCZ, floodRadius, floodLevel;
+              private double floodCX, floodCZ, floodRadius, floodLevel, floodReach;
               private int floodBaseY;
+              private final ArrayList<Long> floodCols = new ArrayList<>();   // columns the water has reached
+              private final HashSet<Long> floodSeen = new HashSet<>();
+              private int floodCursor = 0;
+              private static final int[] DX4 = { 1, -1, 0, 0 };
+              private static final int[] DZ4 = { 0, 0, 1, -1 };
+
+              // supercell cloud that travels with the cloud wall and the tornado
+              private boolean supercellOn = false;
+              private double scX, scZ;
+
+              // blocks the tornado rips out and throws around
+              private static final class Debris {
+                  final int id;
+                  final double ex, ey, ez;     // where it flies to (relative movement)
+                  final double wx, wy, wz;     // where it ends up in the world
+                  int age = 0;
+
+                  Debris(int id, double dx, double dy, double dz, double wx, double wy, double wz) {
+                      this.id = id;
+                      this.ex = dx;
+                      this.ey = dy;
+                      this.ez = dz;
+                      this.wx = wx;
+                      this.wy = wy;
+                      this.wz = wz;
+                  }
+              }
+
+              private final ArrayList<Debris> debris = new ArrayList<>();
+              private int debrisCounter = 0;
 
               // hailstones that are falling right now
               private static final class Hail {
@@ -348,6 +383,11 @@ jobs:
                   pendingWind = -1;
                   pendingWidth = -1;
                   hailstones.clear();
+                  debris.clear();
+                  floodCols.clear();
+                  floodSeen.clear();
+                  floodCursor = 0;
+                  supercellOn = false;
                   radars.clear();
                   floodBlocks.clear();
                   snowBlocks.clear();
@@ -363,6 +403,9 @@ jobs:
                   snowSet.clear();
                   hailstones.clear();
                   runCommand(level, "kill @e[type=minecraft:block_display,tag=palhail]");
+                  runCommand(level, "kill @e[type=minecraft:block_display,tag=paldebris]");
+                  debris.clear();
+                  supercellOn = false;
                   CloudField.INSTANCE.killAll(level);
               }
 
@@ -397,7 +440,11 @@ jobs:
                   List<ServerPlayer> players = level.players();
                   long time = level.getGameTime();
                   tickHailstones(level, players);
+                  tickDebris(level);
                   CloudField.INSTANCE.tick(level, players, cloudMood(), time);
+                  if (supercellOn && time % 40 == 0) {
+                      followSupercell();
+                  }
                   if (players.isEmpty()) {
                       return;
                   }
@@ -565,7 +612,7 @@ jobs:
                           message = "A hurricane is coming from the " + from + "! Strong wind, rain and lightning. The eye is calm.";
                       }
                       case FLOOD -> {
-                          startFlood(players);
+                          startFlood(level, players);
                           message = "Heavy rain is flooding the land! The water keeps rising - go to high ground.";
                       }
                       case STORM -> message = "A thunderstorm is rolling in. The air is hot and the clouds grow dark.";
@@ -574,6 +621,16 @@ jobs:
                       case ICE -> message = "The snow stops, but everything is freezing. Water turns to ice.";
                       case THAW -> message = "The sun comes out and gets hot. Snow and ice are melting.";
                       default -> message = "The sky clears up. Nice weather.";
+                  }
+
+                  // the supercell cloud comes with the cloud wall, the hail and the tornado
+                  if (t == Type.CLOUD_WALL || t == Type.HAIL || t == Type.TORNADO) {
+                      if (!supercellOn) {
+                          beginSupercell(level, players);
+                      }
+                  } else if (supercellOn) {
+                      CloudField.INSTANCE.stopSupercell();
+                      supercellOn = false;
                   }
 
                   applyVanillaWeather(level, t, ticks);
@@ -1010,6 +1067,7 @@ jobs:
                   }
                   tornadoEntities(level, time, groundY, radius);
                   tornadoBreak(level, players, time, radius);
+                  tornadoRip(level, time, radius);
                   tornadoFire(level, time, groundY, radius);
               }
 
@@ -1159,7 +1217,120 @@ jobs:
                           continue;       // only EF4+ scours the ground, roads and foundations themselves
                       }
                       level.destroyBlock(bp, false);
+                      spawnDebris(level, bp, s, radius);
                   }
+              }
+
+              /** Rips the top layers of grass, dirt and sand out of the ground inside the tornado (EF1 and stronger). */
+              private void tornadoRip(ServerLevel level, long time, double radius) {
+                  if (time % 4 != 0 || torWind < 85) {
+                      return;
+                  }
+                  int depth = torWind < 135 ? 1 : (torWind < 200 ? 2 : 3);
+                  int count = 4 + Math.min(20, torWidth / 40);
+                  double r = Math.min(radius * 0.6, 40.0);
+                  for (int i = 0; i < count; i++) {
+                      double a = random.nextDouble() * Math.PI * 2.0;
+                      double d = Math.sqrt(random.nextDouble()) * r;
+                      int x = Mth.floor(torX + Math.cos(a) * d);
+                      int z = Mth.floor(torZ + Math.sin(a) * d);
+                      if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
+                          continue;
+                      }
+                      int gy = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, x, z);
+                      BlockPos bp = new BlockPos(x, gy - 1 - random.nextInt(depth), z);
+                      BlockState s = level.getBlockState(bp);
+                      if (s.isAir() || !s.getFluidState().isEmpty() || !s.is(BlockTags.MINEABLE_WITH_SHOVEL)) {
+                          continue;       // only grass, dirt, sand, gravel ...
+                      }
+                      float hardness = s.getDestroySpeed(level, bp);
+                      if (hardness < 0.0F || hardness > 3.0F) {
+                          continue;
+                      }
+                      level.destroyBlock(bp, false);
+                      spawnDebris(level, bp, s, radius);
+                  }
+              }
+
+              /** A ripped-out block flies up and around inside the tornado as a real 3D block. */
+              private void spawnDebris(ServerLevel level, BlockPos bp, BlockState state, double radius) {
+                  if (debris.size() >= DEBRIS_MAX) {
+                      return;
+                  }
+                  String blockId = BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+                  if (blockId.equals("minecraft:air")) {
+                      return;
+                  }
+                  double height = 40.0 + torWidth * 0.04;
+                  double a = random.nextDouble() * Math.PI * 2.0;
+                  double r = random.nextDouble() * Math.max(3.0, Math.min(radius * 0.5, 40.0));
+                  double wx = torX + Math.cos(a) * r;
+                  double wz = torZ + Math.sin(a) * r;
+                  double wy = bp.getY() + 6.0 + random.nextDouble() * height * 0.8;
+                  int id = ++debrisCounter;
+                  debris.add(new Debris(id, wx - bp.getX(), wy - bp.getY(), wz - bp.getZ(), wx, wy, wz));
+                  String nbt = "{Tags:[\"paldebris\",\"paldebris" + id + "\",\"palsess" + CloudField.INSTANCE.session() + "\"],"
+                          + "block_state:{Name:\"" + blockId + "\"},"
+                          + "transformation:{left_rotation:[0f,0f,0f,1f],right_rotation:[0f,0f,0f,1f],scale:[1f,1f,1f],translation:[0f,0f,0f]},"
+                          + "interpolation_duration:" + DEBRIS_FLY_TICKS + ",view_range:3f}";
+                  runCommand(level, "summon minecraft:block_display " + bp.getX() + " " + bp.getY() + " " + bp.getZ() + " " + nbt);
+              }
+
+              private void tickDebris(ServerLevel level) {
+                  Iterator<Debris> it = debris.iterator();
+                  while (it.hasNext()) {
+                      Debris d = it.next();
+                      d.age++;
+                      if (d.age == 1) {
+                          // start the flight: up and into the funnel, turning around
+                          double s = Math.sin(0.9);
+                          double c = Math.cos(0.9);
+                          double ax = random.nextDouble() - 0.5;
+                          double ay = random.nextDouble() - 0.5;
+                          double az = random.nextDouble() - 0.5;
+                          double al = Math.max(1.0E-6, Math.sqrt(ax * ax + ay * ay + az * az));
+                          runCommand(level, "data merge entity @e[type=minecraft:block_display,tag=paldebris" + d.id + ",limit=1] "
+                                  + "{start_interpolation:0,transformation:{left_rotation:["
+                                  + String.format(Locale.ROOT, "%.3ff,%.3ff,%.3ff,%.3ff", ax / al * s, ay / al * s, az / al * s, c)
+                                  + "],right_rotation:[0f,0f,0f,1f],scale:[1f,1f,1f],translation:["
+                                  + String.format(Locale.ROOT, "%.2ff,%.2ff,%.2ff", d.ex, d.ey, d.ez) + "]}}");
+                      }
+                      if (d.age > DEBRIS_FLY_TICKS + 1) {
+                          runCommand(level, "kill @e[type=minecraft:block_display,tag=paldebris" + d.id + "]");
+                          level.sendParticles(ParticleTypes.POOF, d.wx, d.wy, d.wz, 3, 0.3, 0.3, 0.3, 0.02);
+                          it.remove();
+                      }
+                  }
+              }
+
+              // ------------------------------------------------------------------ supercell cloud
+              private void beginSupercell(ServerLevel level, List<ServerPlayer> players) {
+                  double[] target = supercellTarget();
+                  int bx = Mth.floor(target[0]);
+                  int bz = Mth.floor(target[1]);
+                  int groundY = (int) players.get(0).getY();
+                  if (level.hasChunkAt(new BlockPos(bx, 64, bz))) {
+                      groundY = level.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, bx, bz);
+                  }
+                  CloudField.INSTANCE.startSupercell(target[0], groundY + 30.0, target[1]);
+                  scX = target[0];
+                  scZ = target[1];
+                  supercellOn = true;
+              }
+
+              /** The storm body is behind the cloud wall, and over the tornado when there is one. */
+              private double[] supercellTarget() {
+                  if (tornadoActive) {
+                      return new double[] { torX, torZ };
+                  }
+                  return new double[] { wallX - wallDirX * 60.0, wallZ - wallDirZ * 60.0 };
+              }
+
+              private void followSupercell() {
+                  double[] target = supercellTarget();
+                  CloudField.INSTANCE.moveSupercell(target[0] - scX, target[1] - scZ);
+                  scX = target[0];
+                  scZ = target[1];
               }
 
               private BlockPos randomAround(double cx, double cz, double r, int y) {
@@ -1269,19 +1440,70 @@ jobs:
               }
 
               // ------------------------------------------------------------------ flood
-              private void startFlood(List<ServerPlayer> players) {
+              /** The flood starts at the lowest place near a player and spreads from there. */
+              private void startFlood(ServerLevel level, List<ServerPlayer> players) {
                   ServerPlayer center = players.get(random.nextInt(players.size()));
-                  floodCX = center.getX();
-                  floodCZ = center.getZ();
-                  floodBaseY = center.blockPosition().getY() - 1;
+                  int px = Mth.floor(center.getX());
+                  int pz = Mth.floor(center.getZ());
+                  int bestX = px;
+                  int bestZ = pz;
+                  int bestY = Integer.MAX_VALUE;
+                  for (int dx = -40; dx <= 40; dx += 4) {
+                      for (int dz = -40; dz <= 40; dz += 4) {
+                          if (!level.hasChunkAt(new BlockPos(px + dx, 64, pz + dz))) {
+                              continue;
+                          }
+                          int y = level.getHeight(Heightmap.Types.OCEAN_FLOOR, px + dx, pz + dz);
+                          if (y < bestY) {
+                              bestY = y;
+                              bestX = px + dx;
+                              bestZ = pz + dz;
+                          }
+                      }
+                  }
+                  if (bestY == Integer.MAX_VALUE) {
+                      bestY = center.blockPosition().getY();
+                  }
+                  floodCX = bestX;
+                  floodCZ = bestZ;
+                  floodBaseY = bestY - 1;
                   floodLevel = floodBaseY;
                   floodRadius = 24.0;
+                  floodReach = 0.0;
+                  floodCols.clear();
+                  floodSeen.clear();
+                  floodCursor = 0;
+                  addFloodColumn(bestX, bestZ);
               }
 
-              /** The flood belongs to the land, not to the players: it covers a circle that keeps growing. */
+              private void addFloodColumn(int x, int z) {
+                  long key = BlockPos.asLong(x, 0, z);
+                  if (floodSeen.add(key)) {
+                      floodCols.add(key);
+                  }
+              }
+
+              /** Put water in one column, from the ground up to the flood level. */
+              private void fillFloodColumn(ServerLevel level, int x, int z, int floodY) {
+                  int y = level.getHeight(Heightmap.Types.OCEAN_FLOOR, x, z);
+                  BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, y, z);
+                  while (pos.getY() <= floodY) {
+                      BlockState s = level.getBlockState(pos);
+                      if (s.getFluidState().is(FluidTags.WATER)) {
+                          pos.move(Direction.UP); // already wet, look one higher
+                          continue;
+                      }
+                      if (s.isAir() || s.canBeReplaced()) {
+                          level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
+                          floodBlocks.addLast(pos.asLong());
+                      }
+                      break;
+                  }
+              }
+
+              /** The water rises 0.1 block per second and spreads, step by step, to every neighbour that is low enough. */
               private void tickFlood(ServerLevel level, List<ServerPlayer> players, long time) {
                   floodLevel = Math.min(floodLevel + FLOOD_RISE_PER_TICK, floodBaseY + FLOOD_MAX_RISE);
-                  floodRadius = Math.min(150.0, 24.0 + phaseTicks * 0.04);
                   for (ServerPlayer p : players) {
                       rain(level, p, time, 40);
                       cloudDeck(level, p, time, 5);
@@ -1292,33 +1514,39 @@ jobs:
                                   p.getScoreboardName(), feet));
                       }
                   }
-                  if (time % 10 != 0) {
+                  if (time % 10 != 0 || floodCols.isEmpty()) {
                       return;
                   }
                   int floodY = Mth.floor(floodLevel);
-                  for (int i = 0; i < FLOOD_COLUMNS; i++) {
-                      double a = random.nextDouble() * Math.PI * 2.0;
-                      double d = Math.sqrt(random.nextDouble()) * floodRadius;
-                      int x = Mth.floor(floodCX + Math.cos(a) * d);
-                      int z = Mth.floor(floodCZ + Math.sin(a) * d);
+                  int steps = Math.min(FLOOD_COLUMNS, floodCols.size());
+                  for (int i = 0; i < steps; i++) {
+                      if (floodCursor >= floodCols.size()) {
+                          floodCursor = 0;
+                      }
+                      long key = floodCols.get(floodCursor++);
+                      int x = BlockPos.getX(key);
+                      int z = BlockPos.getZ(key);
                       if (!level.hasChunkAt(new BlockPos(x, 64, z))) {
                           continue;
                       }
-                      int y = level.getHeight(Heightmap.Types.OCEAN_FLOOR, x, z);
-                      BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos(x, y, z);
-                      while (pos.getY() <= floodY) {
-                          BlockState s = level.getBlockState(pos);
-                          if (s.getFluidState().is(FluidTags.WATER)) {
-                              pos.move(Direction.UP); // already wet, look one higher
+                      fillFloodColumn(level, x, z, floodY);
+                      if (floodCols.size() >= FLOOD_MAX_COLUMNS) {
+                          continue;
+                      }
+                      for (int k = 0; k < 4; k++) {
+                          int nx = x + DX4[k];
+                          int nz = z + DZ4[k];
+                          if (floodSeen.contains(BlockPos.asLong(nx, 0, nz)) || !level.hasChunkAt(new BlockPos(nx, 64, nz))) {
                               continue;
                           }
-                          if (s.isAir() || s.canBeReplaced()) {
-                              level.setBlockAndUpdate(pos, Blocks.WATER.defaultBlockState());
-                              floodBlocks.addLast(pos.asLong());
+                          double dist = Math.hypot(nx - floodCX, nz - floodCZ);
+                          if (dist <= FLOOD_MAX_RADIUS && level.getHeight(Heightmap.Types.OCEAN_FLOOR, nx, nz) <= floodY) {
+                              addFloodColumn(nx, nz);
+                              floodReach = Math.max(floodReach, dist);
                           }
-                          break;
                       }
                   }
+                  floodRadius = Math.max(24.0, floodReach + 8.0);
                   washAway(level, floodY);
               }
 
@@ -1682,6 +1910,7 @@ jobs:
            * Options > Video Settings > Clouds = Off, then only these clouds are left.
            *
            * Mood: 0 = white fair-weather clouds, 1 = grey clouds, 2 = dark storm clouds.
+           * A supercell (anvil top + dark flat base + low wall cloud) travels with the cloud wall and the tornado.
            */
           public final class CloudField {
               public static final CloudField INSTANCE = new CloudField();
@@ -1693,16 +1922,18 @@ jobs:
                   final int id;
                   final int puffs;
                   final int mood;
-                  final int life;      // ticks
+                  int life;            // ticks
+                  boolean follow;      // part of the supercell: it is moved by the weather, not by the wind
                   double x;
                   double z;
                   int age = 0;
 
-                  Cell(int id, int puffs, int mood, int life, double x, double z) {
+                  Cell(int id, int puffs, int mood, int life, boolean follow, double x, double z) {
                       this.id = id;
                       this.puffs = puffs;
                       this.mood = mood;
                       this.life = life;
+                      this.follow = follow;
                       this.x = x;
                       this.z = z;
                   }
@@ -1729,7 +1960,7 @@ jobs:
                   return enabled;
               }
 
-              /** New session: cloud cubes saved by an older session (after a crash) are thrown away when they load. */
+              /** New session: cloud cubes saved by an older session (after a crash) are thrown away by the sweep. */
               public void reset() {
                   session = Long.toString(System.nanoTime() % 1000000L);
                   commands.clear();
@@ -1775,12 +2006,62 @@ jobs:
                   }
               }
 
+              // ------------------------------------------------------------------ supercell
+              /** A supercell: light anvil on top, a big dark flat base and a low wall cloud under it. */
+              public void startSupercell(double x, double y, double z) {
+                  stopSupercell();
+                  if (!enabled) {
+                      return;
+                  }
+                  makeRoom(270);
+                  spawnCellAt(x, y + 22.0, z, 70.0, 80, 1, 0.45, 1.5, true);     // anvil on top
+                  spawnCellAt(x, y + 2.0, z, 85.0, 130, 2, 0.30, 1.7, true);      // dark flat base
+                  spawnCellAt(x, y - 10.0, z, 26.0, 40, 2, 0.45, 1.2, true);      // low wall cloud
+              }
+
+              /** The supercell glides along with the storm (the cubes move smoothly because of teleport_duration). */
+              public void moveSupercell(double dx, double dz) {
+                  for (Cell c : cells) {
+                      if (!c.follow) {
+                          continue;
+                      }
+                      c.x += dx;
+                      c.z += dz;
+                      commands.add(String.format(Locale.ROOT, "tp @e[type=minecraft:block_display,tag=palcloud%d] ~%.3f ~ ~%.3f", c.id, dx, dz));
+                  }
+              }
+
+              public void stopSupercell() {
+                  for (Cell c : cells) {
+                      if (c.follow) {
+                          c.follow = false;
+                          c.life = c.age;      // it is removed by the next sweep
+                      }
+                  }
+              }
+
+              /** Remove normal clouds until there is room for a supercell. */
+              private void makeRoom(int puffs) {
+                  Iterator<Cell> it = cells.iterator();
+                  while (puffTotal + puffs > MESH_MAX && it.hasNext()) {
+                      Cell c = it.next();
+                      if (c.follow) {
+                          continue;
+                      }
+                      commands.add("kill @e[type=minecraft:block_display,tag=palcloud" + c.id + "]");
+                      puffTotal -= c.puffs;
+                      it.remove();
+                  }
+              }
+
+              // ------------------------------------------------------------------ normal clouds
               public void tick(ServerLevel level, List<ServerPlayer> players, int mood, long time) {
                   flush(level);
                   // cubes saved by an older session (for example after a crash) are removed as soon as their chunk is loaded
                   if (time % 100 == 0) {
                       run(level, "kill @e[type=minecraft:block_display,tag=palcloud,tag=!palsess" + session + "]");
                       run(level, "kill @e[type=minecraft:block_display,tag=palhail,tag=!palsess" + session + "]");
+                      run(level, "kill @e[type=minecraft:block_display,tag=paldebris,tag=!palsess" + session + "]");
                   }
                   if (!enabled || players.isEmpty()) {
                       return;
@@ -1799,6 +2080,9 @@ jobs:
                       double dx = windX * 40.0;
                       double dz = windZ * 40.0;
                       for (Cell c : cells) {
+                          if (c.follow) {
+                              continue;       // the supercell is moved by the weather
+                          }
                           c.x += dx;
                           c.z += dz;
                           commands.add(String.format(Locale.ROOT, "tp @e[type=minecraft:block_display,tag=palcloud%d] ~%.3f ~ ~%.3f", c.id, dx, dz));
@@ -1811,15 +2095,21 @@ jobs:
                       while (it.hasNext()) {
                           Cell c = it.next();
                           c.age += 20;
-                          boolean far = true;
-                          for (ServerPlayer p : players) {
-                              if (Math.hypot(p.getX() - c.x, p.getZ() - c.z) < 190.0) {
-                                  far = false;
-                                  break;
+                          boolean remove;
+                          if (c.follow) {
+                              remove = c.age >= c.life;
+                          } else {
+                              boolean far = true;
+                              for (ServerPlayer p : players) {
+                                  if (Math.hypot(p.getX() - c.x, p.getZ() - c.z) < 190.0) {
+                                      far = false;
+                                      break;
+                                  }
                               }
+                              boolean wrongMood = c.mood != mood && random.nextInt(8) == 0;
+                              remove = c.age >= c.life || far || wrongMood;
                           }
-                          boolean wrongMood = c.mood != mood && random.nextInt(8) == 0;
-                          if (c.age >= c.life || far || wrongMood) {
+                          if (remove) {
                               commands.add("kill @e[type=minecraft:block_display,tag=palcloud" + c.id + "]");
                               puffTotal -= c.puffs;
                               it.remove();
@@ -1830,7 +2120,13 @@ jobs:
                   // new clouds
                   if (time % 10 == 0 && commands.size() < 150) {
                       int wanted = mood == 2 ? 18 : (mood == 1 ? 14 : 12);
-                      if (cells.size() < wanted) {
+                      int normal = 0;
+                      for (Cell c : cells) {
+                          if (!c.follow) {
+                              normal++;
+                          }
+                      }
+                      if (normal < wanted) {
                           spawnCell(players, mood);
                       }
                   }
@@ -1860,12 +2156,18 @@ jobs:
                   double cy = Math.min(290.0, p.getY() + (mood == 2 ? 36.0 : 46.0) + random.nextDouble() * 18.0);
                   double radius = mood == 2 ? 38.0 + random.nextDouble() * 26.0 : 16.0 + random.nextDouble() * 22.0;
                   int puffs = Mth.clamp((int) (radius * 0.9), 10, 60);
+                  spawnCellAt(cx, cy, cz, radius, puffs, mood, mood == 2 ? 0.55 : 0.8, 1.0, false);
+              }
+
+              /** One cloud: many cubes placed in a flattened dome around the middle. */
+              private void spawnCellAt(double cx, double cy, double cz, double radius, int puffs, int mood,
+                                       double flat, double sizeScale, boolean follow) {
                   if (puffTotal + puffs > MESH_MAX) {
                       return;
                   }
                   int id = ++counter;
-                  int life = (120 + random.nextInt(120)) * 20;
-                  cells.add(new Cell(id, puffs, mood, life, cx, cz));
+                  int life = follow ? 20 * 60 * 20 : (120 + random.nextInt(120)) * 20;
+                  cells.add(new Cell(id, puffs, mood, life, follow, cx, cz));
                   puffTotal += puffs;
 
                   String brightness = mood == 2 ? "{sky:8,block:0}" : (mood == 1 ? "{sky:12,block:0}" : "{sky:15,block:15}");
@@ -1874,9 +2176,9 @@ jobs:
                       double r = Math.sqrt(random.nextDouble()) * radius;
                       double edge = r / radius;
                       double height = (1.0 - edge * edge) * radius * 0.28 * random.nextDouble();
-                      double size = (6.0 + random.nextDouble() * 7.0) * (1.0 - 0.45 * edge);
+                      double size = (6.0 + random.nextDouble() * 7.0) * (1.0 - 0.45 * edge) * sizeScale;
                       double sx = size;
-                      double sy = size * (mood == 2 ? 0.55 : 0.8);
+                      double sy = size * flat;
                       double sz = size;
 
                       // random rotation (quaternion) so the cubes do not look like a grid
@@ -2150,7 +2452,7 @@ jobs:
 
           [[mods]]
           modId = "palweathers"
-          version = "2.2.3"
+          version = "2.7.8"
           displayName = "Palweathers"
           iconFile = "logo.png"
           authors = "Palweathers"
@@ -2790,7 +3092,7 @@ jobs:
           cd mdk
           sed -i -E 's/^mod_id *=.*/mod_id=palweathers/' gradle.properties
           sed -i -E 's/^mod_name *=.*/mod_name=Palweathers/' gradle.properties
-          sed -i -E 's/^mod_version *=.*/mod_version=2.2.3/' gradle.properties
+          sed -i -E 's/^mod_version *=.*/mod_version=2.7.8/' gradle.properties
           sed -i -E 's/^mod_group_id *=.*/mod_group_id=com.palweathers/' gradle.properties
           sed -i -E 's/^mod_authors *=.*/mod_authors=Palweathers/' gradle.properties
           sed -i -E 's/^minecraft_version *=.*/minecraft_version=26.3/' gradle.properties
