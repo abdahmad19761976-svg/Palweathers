@@ -3161,18 +3161,30 @@ jobs:
 
       - name: Build the jar
         working-directory: mdk
+        shell: bash
         run: |
           chmod +x gradlew
           ok=0
+          : > build.log
           for v in 26.3.0.7-beta 26.3.0.6-beta; do
-            echo "=== Trying NeoForge $v ==="
+            echo "=== Trying NeoForge $v ===" | tee -a build.log
             sed -i -E "s/^neo_version *=.*/neo_version=$v/" gradle.properties
-            if ./gradlew build --no-daemon --stacktrace; then
+            if ./gradlew build --no-daemon --stacktrace 2>&1 | tee -a build.log; then
               ok=1
               break
             fi
           done
-          test "$ok" = 1
+          if [ "$ok" != 1 ]; then
+            # put the real error on the first page of the run, so it is easy to read
+            grep -E "error:|symbol:|What went wrong|Could not|Execution failed|FAILURE|not found|does not exist" build.log | head -25 > errors.txt || true
+            echo "### Build errors" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat errors.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            msg=$(sed 's/%/%25/g' errors.txt | paste -sd '|' -)
+            echo "::error title=BUILD ERROR::$msg"
+            exit 1
+          fi
           ls -la build/libs
 
       - name: Save the jar so you can download it
