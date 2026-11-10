@@ -1,0 +1,20 @@
+{
+  "lightning_storm": {
+    "subtitle": "subtitles.palweathers.lightning_storm",
+    "sounds": [
+      "palweathers:lightning_storm"
+    ]
+  },
+  "lightning_hurricane": {
+    "subtitle": "subtitles.palweathers.lightning_hurricane",
+    "sounds": [
+      "palweathers:lightning_hurricane"
+    ]
+  },
+  "lightning_supercell": {
+    "subtitle": "subtitles.palweathers.lightning_supercell",
+    "sounds": [
+      "palweathers:lightning_supercell"
+    ]
+  }
+}
